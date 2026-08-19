@@ -222,7 +222,7 @@ returns four addresses. Two are heap, two are module data, and one of the module
 the thing worth having:
 
 ```
-0x26700F0   "DGDATA%08x  Failure "
+0x26700F0   "DGDATA%08x\0\0Failure\0"
 ```
 
 That is the **format string the header is written with**. It settles two questions that
