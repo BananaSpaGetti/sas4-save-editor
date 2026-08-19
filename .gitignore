@@ -1,0 +1,5 @@
+saves/
+backups/
+decoded/
+__pycache__/
+*.pyc
