@@ -5,8 +5,6 @@ and editing the profile on disk. The memory-scanning work that came first is a d
 dead end and lives in `memscan/`.
 
 `FINDINGS.md` is the handover document: what was established, how, and what is closed.
-`README.th.md` is a Thai summary of this file, kept for the owner of the machine to
-read when picking the work back up.
 
 ## Layout
 
