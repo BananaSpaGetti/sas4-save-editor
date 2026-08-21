@@ -1,25 +1,26 @@
 # SAS4Trainer
 
 Tools for SAS: Zombie Assault 4. The save format is solved, so the working route is reading
-and editing the profile on disk. The memory-scanning work that came first is a documented
-dead end and lives in `memscan/`.
+and editing the profile on disk. Why memory editing does not work on this game is explained
+in `FINDINGS.md`.
 
 `FINDINGS.md` is the handover document: what was established, how, and what is closed.
 
 ## Layout
 
 ```
-dgdata.py     the DGDATA container -- decode, encode, checksum
-sas4.py       the command line: view, list, get, set, verify, decode, encode, watch
-sas4_gui.py   a window over the same machinery; sas4-gui.bat starts it with a double click
-FINDINGS.md   what has been established about the game
-memscan/      the memory scanner and its supporting tools, plus their own README
-saves/        sample profiles                       (not tracked)
-backup-*/     automatic backups taken before edits  (not tracked)
-decoded/      plaintext dumps                       (not tracked)
+dgdata.py       the DGDATA container -- decode, encode, checksum
+sas4.py         the command line: view, list, get, set, give, session, graft, ...
+sas4_gui.py     a window over the same machinery; sas4-gui.bat starts it with a double click
+sas4_model.py   generate a consistent profile, and check one (with a red/blue exercise)
+sas4_train.py   train a from-scratch detector on generated data
+FINDINGS.md     what has been established about the game
+saves/          sample profiles                       (not tracked)
+backups/        automatic backups taken before edits  (not tracked)
+decoded/        plaintext dumps                       (not tracked)
 ```
 
-Nothing under `saves/`, `backup-*/` or `decoded/` is committed: they hold the player's
+Nothing under `saves/`, `backups/` or `decoded/` is committed: they hold the player's
 profile, which carries account data.
 
 ## The format
@@ -61,7 +62,7 @@ py sas4.py graft other.save --fields A,B         copy progress in, keeping your 
 
 `--file` points any of them at a save other than the live one. With no `--file`, the profile
 is **found automatically**: the tools read the Steam install location from the registry and
-walk `userdata\<any id>78800\...\Docs\<account>\Profile.save`, so they work on any
+walk `userdata\<id>\678800\...\Docs\<account>\Profile.save`, so they work on any
 machine with SAS4 installed, no path edited. `py sas4.py where` shows what was found.
 
 For a window instead, run `sas4-gui.bat` (or `py sas4_gui.py`). It lists every value in the

@@ -259,7 +259,7 @@ class Editor(tk.Tk):
                     if filename.lower().endswith(".save"):
                         candidates.append(os.path.join(root, filename))
         if not candidates:
-            messagebox.showinfo("No backups", "Nothing under %s yet." % HERE)
+            messagebox.showinfo("No backups", "Nothing under %s yet." % root_dir)
             return
         chosen = filedialog.askopenfilename(title="Restore which backup?",
                                             initialdir=os.path.dirname(candidates[0]),
@@ -287,11 +287,19 @@ class Editor(tk.Tk):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else sas4.LIVE
-    if not os.path.exists(path):
+    # sas4.LIVE is None when no profile was discovered -- the case after unzipping on a
+    # machine without SAS4. os.path.exists(None) raises, so guard it and let the person pick
+    # a save by hand rather than dying with a traceback.
+    if not path or not os.path.exists(path):
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror("No profile", "Not found:\n%s" % path)
-        return 1
+        chosen = filedialog.askopenfilename(
+            title="No profile found automatically -- open a save",
+            filetypes=[("SAS4 save", "*.save"), ("All files", "*.*")])
+        root.destroy()
+        if not chosen:
+            return 1
+        path = chosen
     Editor(path).mainloop()
     return 0
 

@@ -57,15 +57,6 @@ def xp_for_level(level):
     return XP_TABLE[-1] + step * (level - (len(XP_TABLE) - 1))
 
 
-def level_for_xp(xp):
-    level = 1
-    while xp >= xp_for_level(level + 1):
-        level += 1
-        if level > 200:
-            break
-    return level
-
-
 # --- generate ----------------------------------------------------------------------------
 
 def weapon_entry(item_id, grade=0, bonus=0):
@@ -422,7 +413,6 @@ ATTACKS = {
 
 
 def _apply(attack):
-    import copy
     document = generate(level=1, money=1000)
     attack(document)
     return document

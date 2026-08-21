@@ -802,6 +802,22 @@ def cmd_graft(args):
 
     Nothing is written without --apply; by default it shows what would change.
     """
+    def _contains_identity(value):
+        """The first identity-field key found anywhere inside a value, or None."""
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                if key in IDENTITY_FIELDS:
+                    return key
+                found = _contains_identity(sub)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = _contains_identity(item)
+                if found:
+                    return found
+        return None
+
     source_raw, source = load(args.source)
     dest_raw, dest = load(args.file)
     if not args.fields:
@@ -817,16 +833,21 @@ def cmd_graft(args):
         except (KeyError, IndexError, TypeError):
             print("skip %s -- not in the source" % field)
             continue
-        for name in IDENTITY_FIELDS:
-            if field.split("/")[-1] == name:
-                print("skip %s -- that is an identity field, keeping yours" % field)
-                break
-        else:
-            try:
-                old_value = at_path(dest, field)
-            except (KeyError, IndexError, TypeError):
-                old_value = "<absent>"
-            plan.append((field, old_value, new_value))
+        # Refuse a field that IS an identity field, or one whose value CONTAINS one nested.
+        # Leaf-name matching alone let `--fields Version` copy Version.link through; the
+        # README promises graft keeps your identity, so the whole subtree has to be checked.
+        if field.split("/")[-1] in IDENTITY_FIELDS:
+            print("skip %s -- that is an identity field, keeping yours" % field)
+            continue
+        buried = _contains_identity(new_value)
+        if buried:
+            print("skip %s -- it contains the identity field %r, keeping yours" % (field, buried))
+            continue
+        try:
+            old_value = at_path(dest, field)
+        except (KeyError, IndexError, TypeError):
+            old_value = "<absent>"
+        plan.append((field, old_value, new_value))
 
     if not plan:
         print("nothing to graft")

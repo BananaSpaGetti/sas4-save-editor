@@ -13,7 +13,7 @@ of those and reports its score, for comparison.
     py sas4_train.py --count 4000 --depth 5
     py sas4_train.py --data decoded/train.jsonl     train on a dataset already written
 
-What to look for in the output: the tree reaches the low-to-mid 0.9s and no further, and the
+What to look for in the output: the tree ties the rule baseline and cannot beat it, and the
 confusion matrix says why -- the errors are tampered profiles it calls clean. Those are the
 internally-consistent edits (a level raised with its XP and rank to match), which no feature
 computed from a single file can separate from a real one. That ceiling is the lesson: a
