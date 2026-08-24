@@ -360,21 +360,27 @@ what is in this save. From `SWFplayer/SAS4Tool` (`_PROFILE_OPTIONS_.py`):
 | multiplayer stats | `Inventory/ProfileN/StatsData[i].val` |
 
 **`Strongboxes.Claimed` is not a list of objects.** It is a flattened list in which bare
-integers tag what follows. Their code appends, for a gun:
+integers tag what follows, and **every run is four elements whatever the kind**:
 
 ```
-0, {ID, EquipVersion, Grade, AugmentSlots, BonusStatsLevel, InventoryIndex}, 8, 0
+0, {ID, EquipVersion, Grade, AugmentSlots, BonusStatsLevel, InventoryIndex},              int, int
+1, {ID, EquipVersion, Grade, AugmentSlots, BonusStatsLevel, EquippedSlot, InventoryIndex}, int, int
 ```
 
-and for a piece of equipment:
+So `0` introduces a weapon and `1` introduces equipment, and in both cases two more
+integers close the run.
 
-```
-1, {ID, EquipVersion, Grade, AugmentSlots, BonusStatsLevel, EquippedSlot, InventoryIndex}
-```
+Measured, after an earlier reading of this file said equipment was two elements. That came
+from reading one editor's write path and was never checked against a stream the game had
+written. 36 saves captured with `watch` while boxes were opened divide exactly into runs of
+four, 76 runs in all, and both published editors append four for either kind
+(`0daxelagnia/SAS4Tool`, `_profile_.py` and `_global_.py`).
 
-So `0` introduces a weapon and `1` introduces equipment. That is the schema the empty
-`Strongboxes` here could not supply, and it means items can be granted without waiting for a
-real box to drop.
+The trailing pair is **not validated**. Three constants are in the wild and all of them
+work: `8, 0` (used here), `8, 2` (`_profile_.py`), and whatever the game itself writes,
+which varies with the box -- `2, 2`, `5, 0`, `2, 0` and `2, 1` all observed. The length is
+what matters, because that is what makes the stream parseable: a trailing `0` or `1` reads
+as the start of the next run to a parser that steps by anything else.
 
 `0daxelagnia/SAS4Tool` ships **`items.json`**, roughly 300 entries mapping item IDs to
 names, grouped by rarity tier and by weapon type or armour slot -- pistols, smg, and so on;
@@ -470,6 +476,76 @@ what enforced anything. Offline edits are safe only in the sense that no one can
 whether the account survives depends on a server-side process nobody outside Ninja Kiwi has
 documented.
 
+## Masteries
+
+Masteries are the passive upgrades that come from use: one track per weapon type, one per
+armour piece, and a few for grenades, turrets and HD ammo.
+
+```
+MasteryProgress/MasteryProfileN   N = 0..5, one list per character slot
+  [i] = {"MasteryXp": int, "MasteryLvl": int}   27 entries, every slot
+```
+
+Measured from a real profile and from 36 saves captured while playing. Two things follow
+from the shape:
+
+- **A track cannot be edited field by field.** A profile holds over 150 identical
+  `"MasteryXp":0` fragments, so `anchor_for` cannot pin one down and refuses -- correctly,
+  since a guess would overwrite a different track. The list as a whole has a unique anchor,
+  so `mastery` replaces `MasteryProfileN` in one write, the same way `give` replaces
+  `Claimed`.
+- **XP and level are written together.** Which of the two the game reads is not known;
+  writing both consistently is right either way, and a level its XP cannot reach is the
+  mastery version of a level-40 character holding level-3 XP. `check` objects to it.
+
+**The XP thresholds are the one part taken on trust.** 2,400 / 12,400 / 42,400 / 142,400 /
+542,400 cumulative for levels 1 to 5, from the community wiki. Every track in every capture
+sat at `MasteryLvl: 0` -- the highest XP seen anywhere was 1,253, below the first threshold
+-- so the game has never been observed setting a level here, and none of this is measured
+the way the container format is.
+
+Measurement has put one bound on them. A track holding 1272 XP was still level 0, in the
+file and on the game's own mastery screen alike, so the first threshold is above 1272. The
+wiki's 2400 is consistent with that and nothing has tested it further. Playing a single
+track past the boundary and watching `MasteryLvl` flip to 1 would settle the first
+threshold outright, and is the obvious next measurement.
+
+**The index numbering is being recovered one track at a time.** It is not in the data: the
+item table carries categories (ten weapon, five equipment) but no numbering that lines up
+with 27 tracks, and the `Type` field in `premium_info` indexes a different space -- its ids
+collide with equipment ids, so it cannot be cross-referenced. What works is measurement.
+
+| track | what it is | how |
+|---|---|---|
+| 9 | high damage ammo | the game's mastery screen read 1588 while index 9 held exactly 1588 |
+| 0 | pistols | the mastery screen read 1272 while index 0 held 1272. Reached first by elimination -- two missions with pistols and nothing else moved only 0 and 9, by equal amounts -- then confirmed the direct way |
+
+Nothing else is written down, because nothing else has been established. A wrong name here
+would send an edit to the wrong track, which is worse than no name.
+
+Two things fell out of the measurement:
+
+- **The weapon track and the HD ammo track gain at the same rate.** Both moved +591 in one
+  mission and +660 in the next, exactly together. Neither figure divides by the 6-per-kill
+  the community wiki quotes, so that number does not describe what is in the file.
+- **Track 11 moved in one mission and not the next**, +838 on its own while 0 and 9 moved
+  together. That fits armour, which the wiki says awards one randomly chosen worn piece at
+  mission end -- but it is a guess and is not recorded as anything.
+
+The cheapest way to name another is to read a number off the game's own mastery screen and
+find the track holding it in `py sas4.py mastery`: that names it outright rather than
+inferring it. Failing that, play a mission with one weapon type and nothing else -- no
+grenades, no turrets, which have their own tracks -- and `py sas4.py watch` reports the
+index that moves.
+
+One caution learned here: **the game holds mastery XP in memory and writes it on its own
+schedule.** A mission's gain did not reach the file for eleven minutes. Closing the game
+flushes it.
+
+Setting these is the largest implausible jump these tools can make -- level 5 is on the
+order of ninety thousand kills per track -- and it is a consistent edit, so no single-file
+rule can object. Only the server can, and it has the account's history to compare against.
+
 ## Strongboxes: what can and cannot be done
 
 Boxes come in nine tiers (Steel, Titanium, Molybdenum, Iridium, Neodymium, Promethium,
@@ -485,11 +561,19 @@ limited store sale of three Titanium boxes. Black boxes need a Black Key and lev
   since boxes drop from gameplay rather than anything the save encodes, there is no reference
   to copy. Getting it would mean capturing a real one: `py sas4.py watch --archive` while a
   box is earned but not opened, then reading the diff.
-- **What works instead, and is better: grant the finished item.** `Claimed` is the inventory
-  of what you already own, and its schema is known (weapon = `0,{},8,0`; equipment =
-  `1,{}`). `py sas4.py give <id>` puts an item straight there -- the loot without the box,
-  and without the box's randomness. Grade and bonus are yours to set. Weapon and equipment
-  ids overlap, so `--kind` disambiguates.
+- **What works instead, and is better: grant the finished item.** `py sas4.py give <id>`
+  appends a finished item to `Claimed` -- the loot without the box, and without the box's
+  randomness. Grade and bonus are yours to set. Weapon and equipment ids overlap, so
+  `--kind` disambiguates.
+- **`Claimed` is a hand-off queue, not the inventory.** It was described here as "the
+  inventory of what you already own", which the captures disprove: over 30 boxes opened in
+  one sitting, `Claimed` filled to three runs and drained back to empty within a few
+  seconds each time, while `Weapons` and `Equipment` grew by exactly what left it and
+  `StrongboxesOpened` counted up. A profile at rest has `Claimed: []` however much the
+  character owns -- this one had 12 weapons and 20 pieces of equipment and an empty queue.
+  So it is the right place to *put* a grant, since the game absorbs whatever is there, but
+  the wrong place to *read* what a character owns: for that, read `Weapons` and `Equipment`,
+  whose dicts carry the same fields plus `Seen` and, for equipment, `Equipped`.
 
 ### "Buying for free" -- asked, and why there is no such tool
 
@@ -568,9 +652,10 @@ server knows the rate the level was reached at and how the account compares to m
 others. A save that passes every local check is not a save the server must accept.
 
 `check` is a registry of named rules, so a rule maps to the attacks it catches.
-`redteam --progression` turns the rules on one at a time and prints coverage climbing --
-2, 4, 5, 6, 7, then 8 of 10 -- and then flat, because the last two attacks are consistent
-edits no single-file rule can reach.
+`redteam --progression` turns the rules on one at a time and prints coverage climbing, and
+then flat, because the last attacks are consistent edits no single-file rule can reach. The
+counts are not written down here: they move every time a rule or an attack is added, and a
+number in prose goes stale silently. Run it to see where it stands.
 
 `dataset out.jsonl --count N` writes labelled feature vectors (a consistent profile is
 label 0, a tampered one label 1) for training a detector with ordinary ML. The features are

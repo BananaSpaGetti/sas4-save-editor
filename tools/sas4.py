@@ -13,6 +13,7 @@ built on top of it. It replaces the separate viewer and save-watcher.
     py sas4.py kinds                                how many values of each type, and where
     py sas4.py items                                fetch the item table, once, for names
     py sas4.py give 129                             grant a finished item (the loot, no box)
+    py sas4.py level 40                             set the level, XP, points and rank together
     py sas4.py get /Inventory/Profile0/Money        one value
     py sas4.py set /Inventory/Profile0/Money 250000 change it, checksum and all
     py sas4.py verify                               would the game accept this file
@@ -48,12 +49,21 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The folder holding sas4.bat, one above the code. Backups and dumps belong beside the
+# thing that was double-clicked, not buried in the folder the modules were tidied into:
+# someone looking for a backup after a bad edit looks where they launched from.
+ROOT = os.path.dirname(HERE)
 _spec = importlib.util.spec_from_file_location("dgdata", os.path.join(HERE, "dgdata.py"))
 dgdata = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dgdata)
+
+_mspec = importlib.util.spec_from_file_location("sas4_model", os.path.join(HERE, "sas4_model.py"))
+sas4_model = importlib.util.module_from_spec(_mspec)
+_mspec.loader.exec_module(sas4_model)
 
 GAME_PROCESS = "SAS4-Win.exe"
 APPID = "678800"
@@ -134,9 +144,20 @@ CREDENTIAL_KEYS = ("sessionID", "nkapiID")
 
 # --- reading -----------------------------------------------------------------------------
 
+class SaveError(Exception):
+    """A save that cannot be read: missing, not DGDATA, or JSON that does not parse."""
+
+
 def load(path):
-    raw = open(path, "rb").read()
-    return raw, json.loads(dgdata.decode(raw))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        return raw, json.loads(dgdata.decode(raw))
+    except (OSError, ValueError) as problem:
+        # A hand-edited save the game itself rejects lands here, and so does a wrong path.
+        # Name the file and the reason: a traceback out of json or dgdata tells the reader
+        # only that something deep failed, not which save or why.
+        raise SaveError("cannot read %s\n  %s" % (path, problem)) from problem
 
 
 def at_path(document, path):
@@ -238,15 +259,206 @@ def game_running():
     return GAME_PROCESS.lower().encode() in out.lower()
 
 
-BACKUPS = os.path.join(HERE, "backups")
+def _writable(directory):
+    """True if a file can actually be created in `directory`."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".write-probe")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def data_dir():
+    """Where backups, dumps and caches go.
+
+    In the editor's own folder when that works -- beside `sas4.bat`, not down in `tools/` --
+    which is what someone who extracted a zip to their Desktop expects: the backups sit next
+    to the thing they double-clicked. But a zip extracted
+    under Program Files, or opened from a read-only share, cannot be written to -- and the
+    first thing every write does is take a backup, so that failure lands on the one path
+    that must not fail. Fall back to the per-user location the platform provides.
+
+    Checked once at import rather than per call: the answer does not change while running,
+    and probing on every backup would mean a file created and deleted before every write.
+    """
+    if _writable(ROOT):
+        return ROOT
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        fallback = os.path.join(base, "SAS4Trainer")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"),
+                                                               ".local", "share")
+        fallback = os.path.join(base, "sas4trainer")
+    if _writable(fallback):
+        return fallback
+    return tempfile.gettempdir()            # last resort: better than failing the backup
+
+
+DATA = data_dir()
+BACKUPS = os.path.join(DATA, "backups")
+DECODED = os.path.join(DATA, "decoded")
+SAVES = os.path.join(DATA, "saves")
 
 
 def backup(path):
-    directory = os.path.join(BACKUPS, "backup-" + time.strftime("%Y%m%d-%H%M%S"))
+    """A timestamped copy of `path`, taken before anything writes over it.
+
+    Raises OSError if the copy cannot be made. Callers must let that stop the write rather
+    than carry on: an edit with no backup behind it is the one case FINDINGS.md records
+    actually losing a character.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    name = os.path.basename(path)
+    # The directory is named to the second, so two writes inside one second would land on
+    # the same name and the second copy would overwrite the first -- losing exactly the
+    # state an undo of the second write needs. Rare from the command line, ordinary from
+    # the windows, where granting an item and taking it back again is two clicks. Suffix
+    # until this file's name is free. Zero-padded so the sort the restore dialog does
+    # still puts the newest first past nine.
+    directory = os.path.join(BACKUPS, "backup-" + stamp)
+    attempt = 1
+    while os.path.exists(os.path.join(directory, name)):
+        attempt += 1
+        directory = os.path.join(BACKUPS, "backup-%s-%02d" % (stamp, attempt))
     os.makedirs(directory, exist_ok=True)
-    target = os.path.join(directory, os.path.basename(path))
+    target = os.path.join(directory, name)
     shutil.copyfile(path, target)
     return target
+
+
+# --- shared edit machinery ---------------------------------------------------------------
+#
+# Both command lines and both windows write through these, so the backup, the byte-level
+# replacement and the verify happen once, in one place, however the edit was asked for.
+
+def level_plan(document, level, slot=0):
+    """[(path, value)] that setting a character to `level` has to write.
+
+    Four fields move together. Changing PlayerLevel alone leaves a profile that could not
+    have been played into existence -- a level-40 character holding a level-3 one's XP --
+    and that is what a plausibility check looks for.
+
+    Points already spent count against the level's grant, so a profile with skills bought
+    does not end up over the allowance; and HighestRank is never lowered, since it is the
+    highest ever reached, not the current one.
+    """
+    if not 1 <= level <= sas4_model.MAX_LEVEL:
+        raise ValueError("level must be between 1 and %d" % sas4_model.MAX_LEVEL)
+    where = "Inventory/Profile%d" % slot
+    profile = require_character(document, slot)
+    skills = profile.get("Skills") or {}
+    spent = sum(e.get("SkillLevel", 0) for e in skills.get("SkillsArray") or []
+                if isinstance(e, dict))
+    rank = document.get("Global", {}).get("HighestRank")
+    return [
+        ("%s/Skills/PlayerLevel" % where, level),
+        ("%s/Skills/PlayerTotalXp" % where, sas4_model.xp_for_level(level)),
+        ("%s/Skills/AvailableSkillPoints" % where, max(0, level - spent)),
+        ("Global/HighestRank", max(level, rank if isinstance(rank, int) else 0)),
+    ], spent
+
+
+class EmptySlot(ValueError):
+    """The named character slot exists but nothing has been played in it.
+
+    A ValueError, because every caller already handles one and this is one more way a
+    request cannot be met. Its own class only so a caller can tell it apart: `give` follows
+    a failure with "list them with: py sas4.py items --catalog", which is the right advice
+    for an id it could not resolve and a non sequitur for a slot with no character in it.
+    """
+
+
+def require_character(document, slot, flag="--slot"):
+    """Raise unless `slot` holds a character. Returns the profile when it does.
+
+    A fresh account has six slots and one character. The other five are on disk as the
+    stub `{"Loaded": false}` -- no Skills, no weapons, nothing but the flag saying so.
+    They are not missing, they are empty, and `if not profile` cannot tell the difference
+    because a one-key dictionary is true.
+
+    That gap was reachable two ways. `mastery --slot 4` wrote twenty-seven maxed tracks
+    into a slot with no character, and every later `check` reported them -- including the
+    one `level` runs on its own result, so a later edit to the real character failed and
+    appeared to blame itself. `level --slot 4` skipped all three profile fields, since a
+    stub has no Skills to write into, and still raised Global/HighestRank and took a
+    backup to do it: a write that did nothing it was asked to do.
+
+    `Loaded` is the field the game sets and the field `loaded_profiles` already reads, so
+    deciding it here makes a plan and the check that judges it agree on what a character
+    is, rather than inventing a second answer.
+    """
+    profile = document.get("Inventory", {}).get("Profile%d" % slot)
+    if not isinstance(profile, dict):
+        raise ValueError("no Profile%d in this save" % slot)
+    if not profile.get("Loaded"):
+        live = sorted(where.split("Profile")[-1]
+                      for where, _p in sas4_model.loaded_profiles(document))
+        raise EmptySlot(
+            "character slot %d is empty -- nothing has been played in it.\n"
+            "Slots holding a character: %s. Pass %s with one of those."
+            % (slot, ", ".join(live) if live else "none", flag))
+    return profile
+
+
+def pending(document, plan):
+    """The subset of `plan` that would actually change something, as (path, old, new)."""
+    out = []
+    for path, value in plan:
+        try:
+            current = at_path(document, path)
+        except (KeyError, IndexError, TypeError):
+            continue
+        if current != value:
+            out.append((path, current, value))
+    return out
+
+
+def apply_edits(file_path, plan):
+    """Write [(path, value)] into a save, at byte level, over one backup.
+
+    Returns (ok, backup_path, message). Nothing is written unless every anchor resolves and
+    the rebuilt file verifies, so a partial application cannot reach the disk.
+    """
+    with open(file_path, "rb") as handle:
+        raw = handle.read()
+    try:
+        saved = backup(file_path)
+    except OSError as problem:
+        # Every window and command writes through here, so refusing in one place is what
+        # keeps a failed backup from becoming a traceback in three different UIs.
+        return False, None, ("could not write a backup (%s) -- nothing written.\n"
+                             "Backups go to %s" % (problem, BACKUPS))
+    plain = dgdata.decode(raw)
+    for path, value in plan:
+        document = json.loads(plain)          # each replacement moves the next anchor
+        try:
+            anchor, old_length = anchor_for(document, plain, path)
+        except (KeyError, IndexError, TypeError, ValueError) as problem:
+            # A path that is not in this save raises KeyError out of the walk, not
+            # ValueError; catching only the latter turned a mistyped field into a traceback
+            # in whichever window asked for it. Nothing has been written at this point, so
+            # the file is still whole.
+            return False, saved, "aborted at %s: %s -- nothing written" % (path, problem)
+        replacement = anchor[:-old_length] + json.dumps(value, separators=(",", ":"),
+                                                        ensure_ascii=False).encode("utf-8")
+        plain = plain.replace(anchor, replacement, 1)
+
+    built = dgdata.encode(plain)
+    _, _, ok = dgdata.verify(built)
+    if not ok:
+        return False, saved, "the rebuilt file does not verify -- nothing written"
+    with open(file_path, "wb") as handle:
+        handle.write(built)
+    with open(file_path, "rb") as handle:
+        stored, _, ok = dgdata.verify(handle.read())
+    return ok, saved, "wrote %d field(s), checksum %s (%s)" % (
+        len(plan), stored, "VALID" if ok else "MISMATCH")
+
 
 
 # --- commands ----------------------------------------------------------------------------
@@ -444,78 +656,259 @@ def cmd_set(args):
     return 0 if ok else 1
 
 
+# --- masteries ---------------------------------------------------------------------------
+
+# MasteryProgress sits at the document root, not under Inventory/ProfileN, but is indexed by
+# the same character slot: MasteryProgress/MasteryProfileN is a list of 27 tracks, each
+# {"MasteryXp": int, "MasteryLvl": int}. Measured from a real profile; six slots, 27 entries
+# each, on every one.
+MASTERY_PATH = "MasteryProgress/MasteryProfile%d"
+# The counts and the XP thresholds live in sas4_model, beside the rule that enforces them,
+# so the writer and the checker cannot drift apart. The thresholds are the community wiki's
+# and are the one part taken on trust: every track in every save captured from this game sat
+# at MasteryLvl 0, so the game has never been observed setting one. `mastery` writes XP and
+# level together for that reason -- whichever of the two the game reads, the pair agrees.
+MASTERY_SLOTS = sas4_model.MASTERY_SLOTS
+MASTERY_MAX_LEVEL = sas4_model.MASTERY_MAX_LEVEL
+MASTERY_LEVEL_XP = sas4_model.MASTERY_LEVEL_XP
+mastery_level_for_xp = sas4_model.mastery_level_for_xp
+MASTERY_TRACKS = sas4_model.MASTERY_TRACKS
+mastery_name = sas4_model.mastery_name
+
+
+def mastery_rows(document, slot=0):
+    """[(index, xp, level, level_the_xp_supports)] for one character's mastery tracks."""
+    try:
+        tracks = at_path(document, MASTERY_PATH % slot)
+    except (KeyError, IndexError, TypeError):
+        return []
+    if not isinstance(tracks, list):
+        return []
+    out = []
+    for index, entry in enumerate(tracks):
+        if not isinstance(entry, dict):
+            continue
+        xp = entry.get("MasteryXp", 0) or 0
+        level = entry.get("MasteryLvl", 0) or 0
+        # This feeds a table, and a value that is not a number belongs in it as itself. A
+        # hand-edited file holding "3" where a count goes is worth seeing; rewriting it to
+        # 0 would print a tidy row for a file that is not tidy. The level the XP supports
+        # is None when there is no number to work it out from, and the caller shows that
+        # as a blank rather than claiming a level. Before this, the comparison inside
+        # mastery_level_for_xp raised and the table never appeared at all.
+        supported = mastery_level_for_xp(xp) if isinstance(xp, int) else None
+        out.append((index, xp, level, supported))
+    return out
+
+
+def mastery_plan(document, targets, slot=0):
+    """[(path, value)] setting mastery tracks to levels. `targets` is {index: level}.
+
+    The whole list is replaced rather than each field edited, because the fields cannot be
+    pinned down individually: a profile holds 154 occurrences of `"MasteryXp":0`, and
+    `anchor_for` rightly refuses an anchor it cannot make unique. The list as a whole has a
+    unique anchor, so this follows what `grant_plan` already does with Claimed -- one value,
+    one replacement, one backup, however many tracks move.
+
+    Two indexes have been established by measurement and are named in MASTERY_TRACKS; the
+    rest are not guessed, because a wrong name here sends an edit to the wrong track. To
+    name another, play one mission using one weapon type and run `py sas4.py watch` -- the
+    index whose MasteryXp moves is that type -- or read the number off the game's own
+    mastery screen and find the track holding it.
+    """
+    require_character(document, slot)
+    try:
+        tracks = at_path(document, MASTERY_PATH % slot)
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("no MasteryProgress/MasteryProfile%d in this save" % slot)
+    if not isinstance(tracks, list):
+        raise ValueError("MasteryProgress/MasteryProfile%d is not a list" % slot)
+
+    updated = [dict(entry) if isinstance(entry, dict) else {"MasteryXp": 0, "MasteryLvl": 0}
+               for entry in tracks]
+    for index, level in sorted(targets.items()):
+        if not 0 <= index < len(updated):
+            raise ValueError("track %d is out of range; this save has %d of them"
+                             % (index, len(updated)))
+        if not 0 <= level <= MASTERY_MAX_LEVEL:
+            raise ValueError("mastery level %d is out of range (0-%d)"
+                             % (level, MASTERY_MAX_LEVEL))
+        # Key order as the game writes it, so the replacement reads like the rest of the file.
+        updated[index] = {"MasteryXp": MASTERY_LEVEL_XP[level], "MasteryLvl": level}
+    return [(MASTERY_PATH % slot, updated)]
+
+
+# Every run in Claimed is four elements: the tag, the item dict, and two more integers.
+# The pair is not validated -- three different constants are in the wild and all of them
+# work: this uses 8, 0; 0daxelagnia/SAS4Tool writes 8, 2 in one file and 8, 0 in another;
+# the game itself writes 2, 2 and 5, 0 and 2, 0 and 2, 1 depending on the box. What does
+# matter is the length, because that is what makes the stream parseable.
+CLAIMED_RUN = 4
+CLAIMED_TAIL = [8, 0]
+
+
 def weapon_entry(item_id, grade, bonus):
-    """A finished gun for Strongboxes.Claimed. A bare 0 tags it, then the dict, then 8, 0."""
+    """A finished gun for Strongboxes.Claimed. A bare 0 tags it, then the dict, then the tail."""
     return [0, {"ID": item_id, "EquipVersion": 0, "Grade": grade, "AugmentSlots": 0,
-                "BonusStatsLevel": bonus, "InventoryIndex": 0}, 8, 0]
+                "BonusStatsLevel": bonus, "InventoryIndex": 0}] + CLAIMED_TAIL
 
 
 def equipment_entry(item_id, slot, grade, bonus):
-    """A finished piece of equipment. A bare 1 tags it, then the dict."""
+    """A finished piece of equipment. A bare 1 tags it, then the dict, then the tail."""
     return [1, {"ID": item_id, "EquipVersion": 0, "Grade": grade, "AugmentSlots": 0,
-                "BonusStatsLevel": bonus, "EquippedSlot": slot, "InventoryIndex": slot}]
+                "BonusStatsLevel": bonus, "EquippedSlot": slot,
+                "InventoryIndex": slot}] + CLAIMED_TAIL
+
+
+def claimed_items(document, slotprofile=0):
+    """[(index, kind, id, name, grade, bonus, slot)] for what a profile already owns.
+
+    Claimed is a flattened stream of runs, not a list of objects. Every run is four
+    elements -- tag, item dict, and two more integers -- for equipment as much as for a
+    weapon. The run length is what makes it parseable, since a trailing 0 or 1 would
+    otherwise read as the start of the next run, so whole runs are consumed, never
+    positions.
+
+    Read off 36 saves captured while opening boxes: 36 of 36 divide exactly into runs of
+    four, and both prior-art editors append four for either kind. An earlier reading of
+    two for equipment came from the write side of one of those tools and was never checked
+    against a stream the game had written; it made `drop_claimed` cut a run in half.
+
+    `index` is where the run starts, which is what `drop_claimed` needs to remove it.
+    Anything that does not parse is skipped rather than guessed at.
+    """
+    path = "Inventory/Profile%d/Strongboxes/Claimed" % slotprofile
+    try:
+        claimed = at_path(document, path)
+    except (KeyError, IndexError, TypeError):
+        return []
+    if not isinstance(claimed, list):
+        return []
+
+    names = item_names()
+    out, i = [], 0
+    while i < len(claimed):
+        tag = claimed[i]
+        if tag == 0:
+            kind = "weapon"
+        elif tag == 1:
+            kind = "equipment"
+        else:
+            i += 1
+            continue
+        if i + CLAIMED_RUN > len(claimed):
+            break
+        entry = claimed[i + 1]
+        if isinstance(entry, dict) and isinstance(entry.get("ID"), int):
+            known = names.get(kind, {}).get(entry["ID"])
+            out.append((i, kind, entry["ID"], known[0] if known else "id %d" % entry["ID"],
+                        entry.get("Grade", 0), entry.get("BonusStatsLevel", 0),
+                        entry.get("EquippedSlot")))
+        i += CLAIMED_RUN
+    return out
+
+
+def drop_claimed(document, indexes, slotprofile=0):
+    """[(path, value)] removing the runs starting at `indexes` from Claimed."""
+    path = "Inventory/Profile%d/Strongboxes/Claimed" % slotprofile
+    claimed = at_path(document, path)
+    doomed = set()
+    for start in indexes:
+        if start >= len(claimed):
+            continue
+        if claimed[start] not in (0, 1):
+            continue
+        doomed.update(range(start, min(start + CLAIMED_RUN, len(claimed))))
+    kept = [v for i, v in enumerate(claimed) if i not in doomed]
+    return [(path, kept)]
+
+
+def grant_plan(document, requests, slotprofile=0):
+    """[(path, value)] granting several items at once, plus a label for each.
+
+    One edit however many items: Claimed is a single value, so appending five things is one
+    replacement over one backup rather than five of each.
+
+    `requests` is [(item_id, kind, grade, bonus, slot)]; `kind` may be "auto" when the id is
+    unambiguous. Raises ValueError naming the first request it cannot resolve, before
+    anything is built, so a bad entry cannot half-apply.
+    """
+    domains = item_names()
+    if not domains:
+        raise ValueError("run `items` first so IDs can be resolved to weapon vs equipment")
+    weapons, equipment = domains.get("weapon", {}), domains.get("equipment", {})
+
+    # Same guard as level and mastery, and for the same reason: an unloaded slot has no
+    # Strongboxes to append to, and reporting that as a missing path describes a symptom
+    # rather than the thing that is actually wrong.
+    require_character(document, slotprofile, "--slotprofile")
+    path = "Inventory/Profile%d/Strongboxes/Claimed" % slotprofile
+    try:
+        claimed = at_path(document, path)
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("no Strongboxes/Claimed in Profile%d" % slotprofile)
+
+    added, labels = [], []
+    for item_id, kind, grade, bonus, slot in requests:
+        in_weapon, in_equip = item_id in weapons, item_id in equipment
+        if kind == "auto":
+            if in_weapon and in_equip:
+                raise ValueError("id %d is both a weapon (%s) and equipment (%s) -- say which"
+                                 % (item_id, weapons[item_id][0], equipment[item_id][0]))
+            kind = "weapon" if in_weapon else "equipment" if in_equip else None
+        if kind == "weapon" and in_weapon:
+            added.extend(weapon_entry(item_id, grade, bonus))
+            labels.append("%s (weapon)" % weapons[item_id][0])
+        elif kind == "equipment" and in_equip:
+            added.extend(equipment_entry(item_id, slot, grade, bonus))
+            labels.append("%s (equipment, slot %d)" % (equipment[item_id][0], slot))
+        else:
+            raise ValueError("id %d is not a known %s id"
+                             % (item_id, kind or "weapon or equipment"))
+    return [(path, claimed + added)], labels
+
+
+
+def give_plan(document, item_id, kind="auto", grade=0, bonus=0, slot=2, slotprofile=0):
+    """[(path, value)] granting one finished item, plus a label for it.
+
+    The item goes into Strongboxes.Claimed -- the inventory of what you already own --
+    rather than as an unopened box, because no published tool writes an openable box and
+    the Unopened schema is not documented anywhere. Claimed is also the reliable half: a
+    box is random, a granted item is not.
+
+    The single-item case of `grant_plan`, kept because most callers want exactly one.
+    """
+    plan, labels = grant_plan(document, [(item_id, kind, grade, bonus, slot)], slotprofile)
+    return plan, labels[0]
 
 
 def cmd_give(args):
     """Grant a finished item straight into Strongboxes.Claimed -- the loot without the box.
 
-    No published tool writes an unopened, openable strongbox, and the Unopened schema is not
-    documented anywhere; the boxes drop from bosses and enemies, not from anything a save
-    encodes. What every tool does instead, and what this does, is put the finished item
-    directly into Claimed, which is the inventory of what you already own. That is more
-    reliable than spawning a box, since a box is random and this is not.
-
     py sas4.py give 129                 grant weapon 129 (Z-5 Heavy)
     py sas4.py give 101 --slot 2        grant equipment 101 into slot 2
     py sas4.py give 129 --grade 12 --bonus 10
+
+    `py sas4.py items --catalog` writes the full list of what can be granted.
     """
-    domains = item_names()
-    weapon_ids = domains.get("weapon", {})
-    equip_ids = domains.get("equipment", {})
-    if not domains:
-        print("run `py sas4.py items` first so IDs can be resolved to weapon vs equipment")
-        return 1
-
-    in_weapon = args.item in weapon_ids
-    in_equip = args.item in equip_ids
-    # Weapon and equipment ids overlap -- 101 is both a gun and a vest -- so when an id is in
-    # both tables the caller has to say which with --kind.
-    kind = args.kind
-    if kind == "auto":
-        if in_weapon and in_equip:
-            print("id %d is both a weapon (%s) and equipment (%s)."
-                  % (args.item, weapon_ids[args.item][0], equip_ids[args.item][0]))
-            print("say which with --kind weapon  or  --kind equipment")
-            return 1
-        kind = "weapon" if in_weapon else "equipment" if in_equip else None
-
-    if kind == "weapon" and in_weapon:
-        entry = weapon_entry(args.item, args.grade, args.bonus)
-        label = "%s (weapon)" % weapon_ids[args.item][0]
-    elif kind == "equipment" and in_equip:
-        entry = equipment_entry(args.item, args.slot, args.grade, args.bonus)
-        label = "%s (equipment, slot %d)" % (equip_ids[args.item][0], args.slot)
-    else:
-        print("id %d is not a known %s id" % (args.item, kind or "weapon or equipment"))
-        print("list them with:  py sas4.py items")
-        return 1
-
     raw, d = load(args.file)
     stored, computed, ok = dgdata.verify(raw)
     if not ok and not args.force:
         print("this file does not verify (%s vs %s) -- refusing to edit it" % (stored, computed))
         return 1
-    profile = d.get("Inventory", {}).get("Profile%d" % args.slotprofile)
-    if not profile:
-        print("no Profile%d in this save" % args.slotprofile)
+    try:
+        plan, label = give_plan(d, args.item, args.kind, args.grade, args.bonus,
+                                args.slot, args.slotprofile)
+    except ValueError as problem:
+        print(problem)
+        if not isinstance(problem, EmptySlot):
+            print("list them with:  py sas4.py items --catalog")
         return 1
 
-    path = "Inventory/Profile%d/Strongboxes/Claimed" % args.slotprofile
-    old_claimed = at_path(d, path)
-    new_claimed = old_claimed + entry
-
+    old_len = len(at_path(d, plan[0][0]))
     print("grant %s  (id %d, grade %d, bonus %d)" % (label, args.item, args.grade, args.bonus))
-    print("  Claimed: %d entries -> %d" % (len(old_claimed), len(new_claimed)))
+    print("  Claimed: %d entries -> %d" % (old_len, len(plan[0][1])))
     if args.dry_run:
         print("  (dry run, nothing written)")
         return 0
@@ -523,26 +916,83 @@ def cmd_give(args):
         print("  %s is running -- close it first" % GAME_PROCESS)
         return 1
 
-    plain = dgdata.decode(raw)
-    anchor, old_length = anchor_for(d, plain, path)
-    replacement = anchor[:-old_length] + json.dumps(new_claimed, separators=(",", ":"),
-                                                    ensure_ascii=False).encode("utf-8")
-    saved = backup(args.file)
+    ok, saved, message = apply_edits(args.file, plan)
     print("  backup   %s" % saved)
-    patched = plain.replace(anchor, replacement, 1)
-    built = dgdata.encode(patched)
-    _, _, ok = dgdata.verify(built)
-    if not ok:
-        print("  built file does not verify -- nothing written")
-        return 1
-    with open(args.file, "wb") as handle:
-        handle.write(built)
-    print("  done, checksum now %s" % dgdata.verify(open(args.file, "rb").read())[0])
-    return 0
+    print("  %s" % message)
+    return 0 if ok else 1
 
 
 ITEMS_URL = "https://raw.githubusercontent.com/0daxelagnia/SAS4Tool/main/items.json"
-ITEMS_CACHE = os.path.join(HERE, "decoded", "items.json")
+ITEMS_CACHE = os.path.join(DECODED, "items.json")
+
+
+def cmd_level(args):
+    """Set a character's level, and the three values that have to agree with it.
+
+        Skills/PlayerLevel            the level itself
+        Skills/PlayerTotalXp          the cumulative XP that level starts at
+        Skills/AvailableSkillPoints   one point per level, less any already spent
+        Global/HighestRank            the highest rank reached, never below the level
+
+    All four are written in one pass over one backup, and the result is run through
+    `sas4_model.check` before reporting. Skill points are granted, not spent: the levels are
+    yours to distribute in game. Writing skill levels directly is what FINDINGS.md warns
+    against, so this does not.
+
+    A consistent file is not a safe one. The profile uploads to Ninja Kiwi every ten minutes
+    and the server keeps its own copy, so a jump this makes is a plain diff on their side
+    however well the file agrees with itself.
+    """
+    raw, d = load(args.file)
+    stored, computed, ok = dgdata.verify(raw)
+    if not ok and not args.force:
+        print("this file does not verify (%s vs %s) -- refusing to edit it" % (stored, computed))
+        return 1
+    try:
+        plan, spent = level_plan(d, args.level, args.slot)
+    except ValueError as problem:
+        print(problem)
+        return 1
+
+    print("%s -> level %d" % (args.file, args.level))
+    if spent:
+        print("  %d skill point(s) already spent, so %d are granted rather than %d"
+              % (spent, max(0, args.level - spent), args.level))
+    for path, value in plan:
+        try:
+            current = at_path(d, path)
+        except (KeyError, IndexError, TypeError):
+            print("  skip %s -- not in this save" % path)
+            continue
+        print("  %-46s %s -> %s%s" % (path, json.dumps(current), json.dumps(value),
+                                      "" if current != value else "   (already)"))
+
+    changes = [(p, n) for p, _o, n in pending(d, plan)]
+    if not changes:
+        print("\nnothing to change")
+        return 0
+    if args.dry_run:
+        print("\n  (dry run, nothing written)")
+        return 0
+    if game_running() and not args.force:
+        print("\n%s is running. It rewrites the save on its own schedule and would overwrite"
+              % GAME_PROCESS)
+        print("this edit. Close the game first, or pass --force if you know better.")
+        return 1
+
+    ok, saved, message = apply_edits(args.file, changes)
+    print("\n  backup   %s" % saved)
+    print("  %s" % message)
+    if not ok:
+        return 1
+    problems = sas4_model.check(load(args.file)[1])
+    if problems:
+        print("  but the result is not consistent:")
+        for line in problems:
+            print("    - %s" % line)
+        return 1
+    print("  consistent: nothing a plausibility check would flag")
+    return 0
 
 
 def cmd_items(args):
@@ -564,6 +1014,9 @@ def cmd_items(args):
     table = item_names()
     total = sum(len(entries) for entries in table.values())
     print("wrote %s (%d bytes, %d items)" % (ITEMS_CACHE, len(body), total))
+    if getattr(args, "catalog", None):
+        written = write_catalog(args.catalog)
+        print("wrote %s (%d items, grouped by tier and category)" % (args.catalog, written))
     for domain, entries in sorted(table.items(), key=lambda kv: -len(kv[1])):
         categories = {}
         for _name, category in entries.values():
@@ -572,6 +1025,78 @@ def cmd_items(args):
                                    ", ".join("%s %d" % (c, n) for c, n in
                                              sorted(categories.items(), key=lambda kv: -kv[1]))))
     return 0
+
+
+def item_catalog():
+    """[(domain, tier, category, id, name)] for everything the item table knows.
+
+    `item_names` flattens the table to {domain: {id: (name, category)}} for printing a name
+    beside an id, which throws away the tier a thing belongs to (normal, red, black,
+    factions). The catalogue keeps it, because when the question is "what can I ask for"
+    rather than "what is this id", the tier is most of the answer.
+
+    IDs are unique within a domain -- checked across all 437 entries -- so `give` needs only
+    the id and, when a number is both a weapon and a piece of equipment, --kind.
+    """
+    if not os.path.exists(ITEMS_CACHE):
+        return []
+    try:
+        with open(ITEMS_CACHE, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    rows = []
+
+    def walk(node, domain, tier, category):
+        if isinstance(node, dict):
+            if "Name" in node and isinstance(node.get("ID"), int):
+                rows.append((domain, tier or "-", category or "-", node["ID"], node["Name"]))
+                return
+            for key, value in node.items():
+                # The first level under a domain is the tier, the next is the category.
+                walk(value, domain, tier or key, key if tier else category)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, domain, tier, category)
+
+    for section, node in document.items():
+        walk(node, section.replace("_info", ""), None, None)
+    return rows
+
+
+def write_catalog(path):
+    """A readable list of everything `give` can grant, grouped and with the command to use."""
+    rows = item_catalog()
+    if not rows:
+        return 0
+    groups = {}
+    for domain, tier, category, item_id, name in rows:
+        groups.setdefault((domain, tier, category), []).append((item_id, name))
+
+    with open(path, "w", encoding="utf-8") as out:
+        out.write("# What `give` can grant\n\n")
+        out.write("%d items, from the community table `py sas4.py items` downloads.\n\n"
+                  % len(rows))
+        out.write("Grant one with its ID:\n\n```\npy sas4.py give <id>\n"
+                  "py sas4.py give <id> --kind weapon      when the id is both a weapon and equipment\n"
+                  "py sas4.py give <id> --grade 12 --bonus 10\n```\n\n"
+                  "IDs are unique inside a domain but not across them: equipment 101 and\n"
+                  "weapon 101 are different things, which is what `--kind` settles.\n\n"
+                  "Tiers: **normal**, **red**, **black**, **factions**.\n\n")
+        for domain in ("weapon", "equipment", "turret", "premium"):
+            picked = {k: v for k, v in groups.items() if k[0] == domain}
+            if not picked:
+                continue
+            total = sum(len(v) for v in picked.values())
+            out.write("\n## %s  (%d)\n" % (domain, total))
+            for (_d, tier, category), items in sorted(picked.items()):
+                out.write("\n### %s / %s  (%d)\n\n" % (tier, category, len(items)))
+                out.write("| ID | Name |\n|---:|------|\n")
+                for item_id, name in sorted(items):
+                    out.write("| %d | %s |\n" % (item_id, name))
+    return len(rows)
+
 
 
 _ITEM_CACHE = None
@@ -627,7 +1152,8 @@ def describe(item_id, domain):
 
 
 def cmd_verify(args):
-    raw = open(args.file, "rb").read()
+    with open(args.file, "rb") as handle:
+        raw = handle.read()
     stored, computed, ok = dgdata.verify(raw)
     print("stored   %s\ncomputed %s\n%s" % (stored, computed,
           "VALID" if ok else "MISMATCH - the game would reject this file"))
@@ -636,7 +1162,7 @@ def cmd_verify(args):
 
 def cmd_decode(args):
     raw = open(args.file, "rb").read()
-    out = args.out or os.path.join(HERE, "decoded", "profile.json")
+    out = args.out or os.path.join(DECODED, "profile.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     document = json.loads(dgdata.decode(raw))
     with open(out, "w", encoding="utf-8") as handle:
@@ -646,7 +1172,8 @@ def cmd_decode(args):
 
 
 def cmd_encode(args):
-    plain = open(args.json, "rb").read()
+    with open(args.json, "rb") as handle:
+        plain = handle.read()
     json.loads(plain)
     built = dgdata.encode(plain)
     with open(args.out, "wb") as handle:
@@ -663,7 +1190,7 @@ def cmd_watch(args):
     structure the profile does not currently hold - an unopened strongbox, say.
     """
     print("watching %s -- Ctrl+C to stop" % args.file)
-    store = os.path.join(HERE, "saves")
+    store = SAVES
     if args.archive:
         os.makedirs(store, exist_ok=True)
         print("archiving each version into %s" % store)
@@ -891,7 +1418,10 @@ def cmd_graft(args):
     return 0
 
 
-def main():
+def build_parser():
+    """The command line. Separate from `main` so a test can ask what it accepts: an
+    argument pair that must not be given together is a promise about the interface, and
+    the only way to check it without running a command is to parse and see."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", default=LIVE, help="save file to work on")
@@ -934,7 +1464,28 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true")
 
+    p = sub.add_parser("mastery"); p.set_defaults(run=cmd_mastery)
+    # Two ways to name the same thing. Given both, the code took --all and dropped --set
+    # without a word, so `--set 3=1 --all 5` wrote 5 everywhere and never mentioned the 1.
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--set", help="tracks to raise, e.g. 3=5,7=2")
+    which.add_argument("--all", type=int, metavar="LEVEL",
+                       help="set every track on this character to LEVEL")
+    p.add_argument("--slot", type=int, default=0, help="which character slot")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="write anyway with the game running or the checksum already wrong")
+
+    p = sub.add_parser("level"); p.set_defaults(run=cmd_level)
+    p.add_argument("level", type=int, help="the level to set (1-%d)" % sas4_model.MAX_LEVEL)
+    p.add_argument("--slot", type=int, default=0, help="which character slot")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="write anyway with the game running or the checksum already wrong")
+
     p = sub.add_parser("items"); p.set_defaults(run=cmd_items)
+    p.add_argument("--catalog", nargs="?", const=os.path.join(DATA, "ITEMS.md"),
+                   help="also write a readable list of every grantable item")
 
     p = sub.add_parser("verify"); p.set_defaults(run=cmd_verify)
 
@@ -961,6 +1512,11 @@ def main():
     p.add_argument("--apply", action="store_true", help="write the changes (default: preview)")
     p.add_argument("--force", action="store_true", help="write with the game running")
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -971,13 +1527,131 @@ def main():
         print("no SAS4 profile found automatically on this machine.")
         print("pass one with --file <path>, or run `py sas4.py where` to see what was found.")
         return 1
-    return args.run(args)
+    try:
+        return args.run(args)
+    except SaveError as problem:
+        print(problem)
+        return 1
+
+
+def cmd_mastery(args):
+    """Read the mastery tracks, or set some of them to a level.
+
+        py sas4.py mastery                  what each track holds now
+        py sas4.py mastery --set 3=5        one track to level 5
+        py sas4.py mastery --set 3=5,7=2    several, in one write
+        py sas4.py mastery --all 5          every track on this character
+
+    `mastery` with no arguments prints what each track holds and names the ones that have
+    been established. The rest are not guessed. To name another, play one mission using one
+    weapon type, run `py sas4.py watch`, and the track whose MasteryXp moves is that type;
+    `watch` already reports these paths.
+
+    A consistent file is not a safe one, and this is the largest implausible jump these
+    tools can make: level 5 is on the order of ninety thousand kills per track. The profile
+    uploads to Ninja Kiwi every ten minutes and the server keeps its own copy, so setting a
+    row of them is a plain diff on their side however well the file agrees with itself.
+    """
+    raw, d = load(args.file)
+    stored, computed, ok = dgdata.verify(raw)
+    if not ok and not args.force:
+        print("this file does not verify (%s vs %s) -- refusing to edit it" % (stored, computed))
+        return 1
+
+    rows = mastery_rows(d, args.slot)
+    if not rows:
+        print("no mastery tracks in slot %d of %s" % (args.slot, args.file))
+        return 1
+
+    targets = {}
+    if args.all is not None:
+        targets = {index: args.all for index, _xp, _lvl, _fits in rows}
+    elif args.set:
+        for piece in args.set.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            index, _, level = piece.partition("=")
+            try:
+                targets[int(index)] = int(level)
+            except ValueError:
+                print("cannot read %r -- write it as <track>=<level>, e.g. 3=5" % piece)
+                return 1
+
+    if not targets:
+        print("%s, character slot %d" % (args.file, args.slot))
+        print("  track   XP        level   what it is")
+        for index, xp, level, fits in rows:
+            if fits is None:
+                note = "   <- this is not a number"
+            elif level != fits:
+                note = "   <- level disagrees with the XP"
+            else:
+                note = ""
+            # %s, not %d: a value odd enough to be worth a note has to survive being
+            # printed, and %d on a string is the crash the note exists to describe.
+            print("  %5d   %-9s %-7s %s%s"
+                  % (index, xp, level, mastery_name(index) or "?", note))
+        print("\n%d track(s). Levels reach %s XP." % (len(rows), MASTERY_LEVEL_XP[-1]))
+        known = len(MASTERY_TRACKS)
+        print("%d of them are named; the rest are not guessed. To name one, read its XP off"
+              % known)
+        print("the game's own mastery screen and find the track holding that number above.")
+        return 0
+
+    try:
+        plan = mastery_plan(d, targets, args.slot)
+    except ValueError as problem:
+        print(problem)
+        return 1
+
+    print("%s, character slot %d" % (args.file, args.slot))
+    for index, level in sorted(targets.items()):
+        was = next((r for r in rows if r[0] == index), None)
+        print("  track %-3d  xp %-9s -> %-9d   level %s -> %d"
+              % (index, was[1] if was else "?", MASTERY_LEVEL_XP[level],
+                 was[2] if was else "?", level))
+
+    # Asking for the levels a character already has is a no-op, and `level` has always
+    # stopped here rather than write one. Doing it anyway costs a backup folder, and the
+    # cost is not the disk: `Restore backup...` lists them newest first, so a run of
+    # backups that changed nothing pushes the one worth restoring down the list.
+    if not pending(d, plan):
+        print("\nnothing to change")
+        return 0
+    if args.dry_run:
+        print("\n(dry run -- nothing written)")
+        return 0
+    if game_running() and not args.force:
+        print("\n%s is running -- close it first" % GAME_PROCESS)
+        return 1
+
+    ok, saved, message = apply_edits(args.file, plan)
+    print("\n%s" % message)
+    if not ok:
+        return 1
+    print("backup   %s" % saved)
+    problems = sas4_model.check(load(args.file)[1])
+    if problems:
+        # `level` reports the same failure as an exit code and this did not, so a script
+        # that wrote a profile the checker rejects was told it had succeeded.
+        print("check    the result is not consistent:")
+        for line in problems:
+            print("           - %s" % line)
+        print("         the backup above is the way back.")
+        return 1
+    print("check    clean")
+    print("\nThe server keeps its own copy of this profile. A row of maxed masteries is a"
+          "\nplain diff on their side, however well the file agrees with itself.")
+    return 0
 
 
 def cmd_where(args):
     """Show the SAS4 profiles discovered on this machine."""
     steam = find_steam()
     print("Steam: %s" % (steam or "not found"))
+    print("writes to: %s%s"
+          % (DATA, "" if DATA == ROOT else "   (beside the tools is not writable)"))
     profiles = find_profiles()
     if not profiles:
         print("no SAS4 profile found. Pass --file <path> to any command to point at one.")

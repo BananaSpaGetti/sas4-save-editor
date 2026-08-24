@@ -26,30 +26,61 @@ import importlib.util
 import json
 import os
 import sys
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    # tkinter ships with Python but installers can leave it out, and most Linux
+    # distributions split it into a separate package. Say so plainly: without it this
+    # window cannot open, but nothing else in the toolset needs it.
+    raise SystemExit(
+        "This editor needs tkinter, which did not come with this Python.\n\n"
+        "  Windows: re-run the Python installer, choose Modify, and tick\n"
+        "           'tcl/tk and IDLE'.\n"
+        "  Linux:   install the python3-tk package.\n\n"
+        "Everything the window does, `sas4.py` also does from a terminal:\n"
+        "  py sas4.py where     find the profile\n"
+        "  py sas4.py view      read it\n"
+        "  py sas4.py set ...   change one value")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("sas4", os.path.join(HERE, "sas4.py"))
 sas4 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sas4)
+_uspec = importlib.util.spec_from_file_location("sas4_ui", os.path.join(HERE, "sas4_ui.py"))
+sas4_ui = importlib.util.module_from_spec(_uspec)
+_uspec.loader.exec_module(sas4_ui)
 dgdata = sas4.dgdata
 
 
-class Editor(tk.Tk):
-    def __init__(self, path):
-        super().__init__()
-        self.title("SAS4 profile editor")
-        self.geometry("1040x660")
-        self.minsize(760, 460)
+class Editor(sas4_ui.Dialogs, ttk.Frame):
+    """Every value in the profile. A tab of `sas4.bat`, or the whole of `sas4-gui.bat`.
 
-        self.path = path
+    `path` may be a plain string or a `StringVar`. The combined window passes one variable
+    to all three panels so that opening a save in any of them opens it in all of them; the
+    property below keeps the rest of this class reading and writing `self.path` as a string
+    either way.
+    """
+
+    def __init__(self, parent, path, on_advanced=None, on_items_changed=None):
+        super().__init__(parent)
+        self.on_advanced = on_advanced
+        self.on_items_changed = on_items_changed
+        self.path_var = path if isinstance(path, tk.StringVar) else tk.StringVar(value=path or "")
         self.document = None
         self.rows = []                 # (path, value) for every scalar, in document order
         self.staged = {}               # path -> new value, not yet written
 
         self._build()
         self.reload()
+
+    @property
+    def path(self):
+        return self.path_var.get()
+
+    @path.setter
+    def path(self, value):
+        self.path_var.set(value or "")
 
     # --- layout --------------------------------------------------------------------------
 
@@ -107,7 +138,7 @@ class Editor(tk.Tk):
         try:
             raw, self.document = sas4.load(self.path)
         except Exception as problem:
-            messagebox.showerror("Cannot read this file", str(problem))
+            self._error("Cannot read this file", str(problem))
             self.status.set("failed to read %s" % self.path)
             return
         stored, computed, ok = dgdata.verify(raw)
@@ -170,7 +201,7 @@ class Editor(tk.Tk):
         try:
             new = sas4.coerce(self.value_var.get(), current)
         except ValueError as problem:
-            messagebox.showerror("Wrong type", "%s holds %s (%s).\n\n%s"
+            self._error("Wrong type", "%s holds %s (%s).\n\n%s"
                                  % (path, json.dumps(current), type(current).__name__, problem))
             return
         if new == current:
@@ -193,7 +224,7 @@ class Editor(tk.Tk):
         if not self.staged:
             return
         if sas4.game_running():
-            messagebox.showwarning(
+            self._warn(
                 "The game is running",
                 "SAS4 rewrites the profile on its own schedule and would overwrite this "
                 "edit.\n\nClose the game, then press Save again.")
@@ -202,13 +233,16 @@ class Editor(tk.Tk):
         summary = "\n".join("  %s\n      %s  ->  %s"
                             % (p, json.dumps(sas4.at_path(self.document, p)), json.dumps(v))
                             for p, v in self.staged.items())
-        if not messagebox.askokcancel("Write these changes?",
+        if not self._ask("Write these changes?",
                                       "%s\n\nA backup is taken first."
                                       % summary):
             return
 
-        saved = sas4.backup(self.path)
         try:
+            # Inside the try on purpose: a backup that cannot be written -- a zip extracted
+            # under Program Files, a read-only share -- must stop the write and say so,
+            # not take the window down with a traceback.
+            saved = sas4.backup(self.path)
             raw = open(self.path, "rb").read()
             plain = dgdata.decode(raw)
             # One value at a time, re-parsing in between: each replacement changes the
@@ -227,28 +261,26 @@ class Editor(tk.Tk):
             with open(self.path, "wb") as handle:
                 handle.write(built)
         except Exception as problem:
-            messagebox.showerror("Not written", "%s\n\nThe file is unchanged.\nBackup: %s"
-                                 % (problem, saved))
+            self._error("Not written", "%s\n\nThe file is unchanged.\nBackups go to %s"
+                                 % (problem, sas4.BACKUPS))
             return
 
         check = open(self.path, "rb").read()
         stored, _, ok = dgdata.verify(check)
         count = len(self.staged)
         self.reload()
-        messagebox.showinfo("Saved", "%d value%s written.\nChecksum %s (%s).\nBackup: %s"
+        self._info("Saved", "%d value%s written.\nChecksum %s (%s).\nBackup: %s"
                             % (count, "" if count == 1 else "s", stored,
                                "valid" if ok else "MISMATCH", saved))
 
     def open_file(self):
-        chosen = filedialog.askopenfilename(title="Open a profile",
-                                            filetypes=[("SAS4 save", "*.save"),
-                                                       ("All files", "*.*")])
+        chosen = self._pick_save("Open a profile")
         if chosen:
             self.path = chosen
             self.reload()
 
     def restore(self):
-        root_dir = sas4.BACKUPS if os.path.isdir(sas4.BACKUPS) else HERE
+        root_dir = sas4.BACKUPS if os.path.isdir(sas4.BACKUPS) else sas4.ROOT
         backups = sorted((name for name in os.listdir(root_dir)
                           if name.startswith("backup-") and os.path.isdir(os.path.join(root_dir, name))),
                          reverse=True)
@@ -259,49 +291,42 @@ class Editor(tk.Tk):
                     if filename.lower().endswith(".save"):
                         candidates.append(os.path.join(root, filename))
         if not candidates:
-            messagebox.showinfo("No backups", "Nothing under %s yet." % root_dir)
+            self._info("No backups", "Nothing under %s yet." % root_dir)
             return
-        chosen = filedialog.askopenfilename(title="Restore which backup?",
+        chosen = filedialog.askopenfilename(title="Restore which backup?", parent=self,
                                             initialdir=os.path.dirname(candidates[0]),
                                             filetypes=[("SAS4 save", "*.save")])
         if not chosen:
             return
         if sas4.game_running():
-            messagebox.showwarning("The game is running", "Close SAS4 first.")
+            self._warn("The game is running", "Close SAS4 first.")
             return
         raw = open(chosen, "rb").read()
         stored, computed, ok = dgdata.verify(raw)
-        if not ok and not messagebox.askokcancel(
+        if not ok and not self._ask(
                 "That backup does not verify",
                 "stored %s, computed %s.\n\nRestore it anyway?" % (stored, computed)):
             return
-        if not messagebox.askokcancel("Restore?", "Overwrite\n  %s\nwith\n  %s"
+        if not self._ask("Restore?", "Overwrite\n  %s\nwith\n  %s"
                                       % (self.path, chosen)):
             return
-        sas4.backup(self.path)
+        try:
+            sas4.backup(self.path)
+        except OSError as problem:
+            self._error("Not restored",
+                                 "Could not write a backup of the current file first:\n%s\n\n"
+                                 "Backups go to %s\n\nNothing was changed."
+                                 % (problem, sas4.BACKUPS))
+            return
         with open(self.path, "wb") as handle:
             handle.write(raw)
         self.reload()
-        messagebox.showinfo("Restored", "Restored from %s" % chosen)
+        self._info("Restored", "Restored from %s" % chosen)
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else sas4.LIVE
-    # sas4.LIVE is None when no profile was discovered -- the case after unzipping on a
-    # machine without SAS4. os.path.exists(None) raises, so guard it and let the person pick
-    # a save by hand rather than dying with a traceback.
-    if not path or not os.path.exists(path):
-        root = tk.Tk()
-        root.withdraw()
-        chosen = filedialog.askopenfilename(
-            title="No profile found automatically -- open a save",
-            filetypes=[("SAS4 save", "*.save"), ("All files", "*.*")])
-        root.destroy()
-        if not chosen:
-            return 1
-        path = chosen
-    Editor(path).mainloop()
-    return 0
+    return sas4_ui.run_standalone(Editor, "SAS4 profile editor", "1040x660", (760, 460),
+                                  sys.argv[1] if len(sys.argv) > 1 else sas4.LIVE)
 
 
 if __name__ == "__main__":
