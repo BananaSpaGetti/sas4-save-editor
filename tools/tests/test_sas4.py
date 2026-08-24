@@ -652,6 +652,87 @@ class TestWindows(Temp):
             hub.destroy()
 
 
+class TestContribute(Temp):
+    """The shared report: what it carries, and what it must never carry."""
+
+    def planted(self):
+        """A generated profile with a real-shaped identity in every field that holds one.
+
+        The values are invented, not copied from a profile. This file ships inside the zip,
+        and `make_dist.py` refused to package it when they were real -- which is the guard
+        working, and the reason the shapes below are made up rather than observed.
+        """
+        document = model.generate(level=12, money=5000)
+        document["Version"]["link"] = "a1b2c3d4e5f60718293a4b5c"
+        document["Version"]["analytics"] = "NO_LINK{0f1e2d3c4b5a69788796a5b4c3d2e1f0}"
+        document["Settings"]["Name"] = "SomePlayerName"
+        document["Inventory"]["Profile0"]["Name"] = "SomeCharacterName"
+        return document
+
+    def test_no_identity_value_reaches_the_report(self):
+        """The point of the whole feature. Values, not field names: the schema section lists
+        the path `/Version/link` on purpose, because a path name cannot identify anybody."""
+        document = self.planted()
+        report = sas4.contribution_report(document, 0)
+        for value in ("a1b2c3d4e5f60718293a4b5c",
+                      "NO_LINK{0f1e2d3c4b5a69788796a5b4c3d2e1f0}",
+                      "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                      "SomePlayerName", "SomeCharacterName"):
+            self.assertNotIn(value, report, value)
+
+    def test_the_schema_section_carries_names_but_no_values(self):
+        """It is the one section that walks unknown fields, so it is the one that could leak
+        a value it has never been told about. It may not carry values at all."""
+        document = self.planted()
+        document["SomethingNobodyHasSeen"] = {"Nested": "a-value-that-must-not-appear"}
+        report = sas4.contribution_report(document, 0)
+        self.assertIn("/SomethingNobodyHasSeen/Nested", report, "a new field is reported")
+        self.assertNotIn("a-value-that-must-not-appear", report, "but never its value")
+
+    def test_a_new_field_is_not_carried_into_the_named_sections(self):
+        """The allowlist has to be a build-from-names, not a walk-and-filter. A field the
+        game adds later must be invisible to everything except the schema list."""
+        document = model.generate()
+        document["Inventory"]["Profile0"]["FutureSecret"] = "leak-me"
+        report = sas4.contribution_report(document, 0)
+        body = report.split("### Every path in the file")[0]
+        self.assertNotIn("leak-me", body)
+        self.assertNotIn("FutureSecret", body)
+
+    def test_the_guard_catches_every_shape_of_id(self):
+        for planted, why in (("a1b2c3d4e5f60718293a4b5c", "24 hex, the account id shape"),
+                             ("0f1e2d3c4b5a69788796a5b4c3d2e1f0", "32 hex, the analytics id"),
+                             ("76561198000000000", "17 digits, a Steam id"),
+                             ("C:\\Users\\somebody\\Profile.save", "a local path"),
+                             ("steam/userdata/999888777", "the folder holding the account")):
+            self.assertTrue(sas4.scan_report_for_ids("body " + planted), why)
+
+    def test_the_guard_does_not_fire_on_a_real_looking_report(self):
+        """A guard that refuses every genuine save is a guard people turn off. Timestamps are
+        the trap: a profile holds fourteen values of nine or more digits, all legitimate, so
+        the digit threshold sits above them rather than below."""
+        document = model.generate(level=40, money=999999999)
+        document["Version"]["SaveTime"] = 1787573395            # 10 digits
+        document["NewsTimeStamp"] = 1787568002965               # 13 digits
+        report = sas4.contribution_report(document, 0)
+        self.assertEqual(sas4.scan_report_for_ids(report), [])
+
+    def test_the_mastery_table_is_in_the_report(self):
+        """It is the reason the feature exists -- 25 of 27 tracks unnamed -- so the table
+        being there is not incidental."""
+        document = model.generate()
+        document["MasteryProgress"]["MasteryProfile0"][9] = {"MasteryXp": 1588, "MasteryLvl": 0}
+        report = sas4.contribution_report(document, 0)
+        self.assertIn("| 9 | 1588 | 0 | high damage ammo |", report)
+        self.assertIn("| 26 |", report, "every track, not only the named ones")
+
+    def test_identity_fields_covers_the_analytics_id(self):
+        """Grafting `Version` was always refused because `link` is in it, but naming
+        `Version/analytics` on its own copied an account identifier across."""
+        self.assertIn("analytics", sas4.IDENTITY_FIELDS)
+        self.assertIn("link", sas4.IDENTITY_FIELDS)
+
+
 class TestPrivacyGuard(unittest.TestCase):
     """The packaging guard that keeps personal data out of a release."""
 

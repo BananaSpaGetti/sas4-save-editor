@@ -191,6 +191,32 @@ to find out what is in a file, or to change something the quick window does not 
 Both go through exactly the same code as `set` -- same refusal while the game is running,
 same automatic backup, same byte-level replacement, same verify afterwards.
 
+### Contributing a reading
+
+Twenty-five of the twenty-seven mastery tracks have no name, and the level thresholds are
+bounded rather than measured. Neither is answerable from one account.
+
+```
+py sas4.py contribute          write a shareable report, and print it
+py sas4.py contribute --print  print it and write nothing
+```
+
+The report holds mastery rows, the item ids owned, the shape of the Claimed stream, and
+every path in the file **as names and types with no values**. It does not hold the account
+id in `Version/link`, the second one in `Version/analytics`, the names in `Settings/Name` or
+`Inventory/ProfileN/Name`, the path the save was read from — that carries the Steam account
+number — or the money.
+
+It is built by naming each field, not by walking the profile and removing what looks
+private, so a field the game adds in a later patch is invisible to it until someone adds it
+on purpose. Before the file is written the finished text is checked a second time against
+the shapes an account id takes, and the command refuses rather than writes if anything
+matches.
+
+**Nothing is sent anywhere.** The report is printed in full so you can read it, written to a
+file beside `sas4.bat`, and posting it is something you do yourself. There is a *Mastery
+track* issue template that says what is most useful.
+
 ### Masteries
 
 Masteries are the passive upgrades that come from use: one track per weapon type, one per

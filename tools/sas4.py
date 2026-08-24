@@ -46,6 +46,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -133,7 +134,12 @@ SESSION = session_for(LIVE) if LIVE else None
 
 # Fields that carry account identity, keyed by the file they live in. Grafting another
 # player's progress means copying everything EXCEPT these, so the profile stays yours.
-IDENTITY_FIELDS = ("link",)                      # in the profile JSON
+# Both live in Version. `link` is the account the save belongs to; `analytics` holds a
+# 32-hex id of its own inside a NO_LINK{...} wrapper, which is just as much a way to say
+# whose file this is. It was missing here until a real profile was read field by field for
+# the contribute report -- grafting `Version` was refused anyway, because `link` is in it,
+# but naming `Version/analytics` on its own went straight through.
+IDENTITY_FIELDS = ("link", "analytics")          # in the profile JSON
 # In current.session: sessionID is the real secret -- a login token the server issues, so
 # it is never printed in full. nkapiID is the account id, which is also the save folder
 # name and appears in every path already, so it is shown; but editing either is gated,
@@ -1476,6 +1482,11 @@ def build_parser():
     p.add_argument("--force", action="store_true",
                    help="write anyway with the game running or the checksum already wrong")
 
+    p = sub.add_parser("contribute"); p.set_defaults(run=cmd_contribute)
+    p.add_argument("--slot", type=int, default=0, help="which character slot")
+    p.add_argument("--print", dest="print_only", action="store_true",
+                   help="print the report and write no file")
+
     p = sub.add_parser("level"); p.set_defaults(run=cmd_level)
     p.add_argument("level", type=int, help="the level to set (1-%d)" % sas4_model.MAX_LEVEL)
     p.add_argument("--slot", type=int, default=0, help="which character slot")
@@ -1643,6 +1654,231 @@ def cmd_mastery(args):
     print("check    clean")
     print("\nThe server keeps its own copy of this profile. A row of maxed masteries is a"
           "\nplain diff on their side, however well the file agrees with itself.")
+    return 0
+
+
+# --- contributing a reading, for the people who want to ------------------------------------
+
+# What a shared report may contain, and nothing else.
+#
+# The report is BUILT FROM NAMED FIELDS, never by walking the profile and removing what looks
+# private. The difference decides what happens to a field the game adds in a later patch: a
+# walk-and-filter emits it by default and only a rule stops it, so the failure is silent and
+# lands on the person who trusted the tool. Building from names can only ever emit what is
+# typed here -- a new field is invisible until someone adds it on purpose. This is the same
+# reason make_dist.py packages a named file list rather than a glob.
+#
+# The one section that cannot work that way is the schema list, which exists precisely to
+# report fields nobody has seen. It emits path NAMES AND TYPES ONLY, never a value. A path
+# name cannot carry an account id.
+
+CONTRIBUTE_VERSION = 1
+
+# Refuse to write a report containing any of these. A backstop behind the allowlist, not the
+# defence itself -- if one of these fires, the allowlist above already has a mistake in it.
+#
+# The thresholds are measured, not guessed. Against a real profile: 24-hex matches
+# `Version/link` (24 lowercase hex) and the id inside `Version/analytics` (32); a 15-digit
+# run appears nowhere at all, while a 9-digit rule -- the obvious first guess -- fires on
+# fourteen legitimate timestamps and would make the command refuse on every real save. The
+# path patterns matter because the save's own location carries the Steam account number in
+# it, so the path is never printed even though it is the most natural thing to put in a
+# report header.
+ID_PATTERNS = [
+    (r"[0-9a-f]{24,}", "a long hex string, which is the shape of an account id"),
+    (r"[0-9]{15,}", "a very long number, which is the shape of an account id"),
+    (r"[A-Za-z]:[\\/]", "a path on your machine"),
+    (r"[Uu]serdata", "a Steam userdata path, which contains your account number"),
+]
+
+
+def scan_report_for_ids(text):
+    """[(pattern description, what matched)] for anything in `text` shaped like an id."""
+    found = []
+    for pattern, description in ID_PATTERNS:
+        for match in re.findall(pattern, text):
+            found.append((description, match))
+    return found
+
+
+def _mastery_section(document, slot):
+    lines = ["| track | XP | level | what it is |", "|---:|---:|---:|---|"]
+    for index, xp, level, _fits in mastery_rows(document, slot):
+        lines.append("| %d | %s | %s | %s |"
+                     % (index, xp, level, mastery_name(index) or ""))
+    return lines
+
+
+def _item_section(document, slot, key):
+    """Item and augment ids owned. Catalogue numbers, the same for everyone who owns one."""
+    try:
+        rows = at_path(document, "Inventory/Profile%d/%s" % (slot, key))
+    except (KeyError, IndexError, TypeError):
+        return ["(none in this save)"]
+    if not isinstance(rows, list) or not rows:
+        return ["(none in this save)"]
+    out = ["| id | grade | augment 1 | augment 2 |", "|---:|---:|---:|---:|"]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append("| %s | %s | %s | %s |"
+                   % (row.get("ID"), row.get("Grade"),
+                      row.get("Augment1ID"), row.get("Augment2ID")))
+    return out
+
+
+def _schema_section(document):
+    """Every path in the file, with the types seen at it. Names and types, never values."""
+    seen = {}
+
+    def walk(node, path=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, path + "/" + str(key))
+        elif isinstance(node, list):
+            seen.setdefault(path, set()).add("list")
+            for value in node:
+                walk(value, path + "/*")
+        else:
+            seen.setdefault(path, set()).add(type(node).__name__)
+
+    walk(document)
+    return ["%s  %s" % (path, "/".join(sorted(seen[path]))) for path in sorted(seen)]
+
+
+def contribution_report(document, slot=0):
+    """A report about one save that carries no identity, as Markdown.
+
+    Every field is named here explicitly. Notably absent, and absent on purpose:
+    `Version/link` and `Version/analytics` (both account identifiers), `Settings/Name` and
+    `Inventory/ProfileN/Name` (the player's chosen names), the path the save was read from
+    (it contains the Steam account number), and money -- which is nobody's business and
+    answers no question the format still has open.
+    """
+    version = document.get("Version") or {}
+    globals_ = document.get("Global") or {}
+    skills = (document.get("Inventory", {}).get("Profile%d" % slot) or {}).get("Skills") or {}
+    try:
+        claimed = at_path(document, "Inventory/Profile%d/Strongboxes/Claimed" % slot)
+    except (KeyError, IndexError, TypeError):
+        claimed = []
+
+    lines = [
+        "## SAS4 save reading (report format %d)" % CONTRIBUTE_VERSION,
+        "",
+        "Produced by `py sas4.py contribute`. It holds no account id, no player name and no",
+        "file path -- only numbers about a character and the shape of the file. Read it before",
+        "you post it; that is what it is printed for.",
+        "",
+        "### The file",
+        "",
+        "| | |",
+        "|---|---|",
+        "| game version | %s |" % (version.get("LastGame"),),
+        "| original version | %s |" % (version.get("OriginalVersion"),),
+        "| profile format | %s |" % (version.get("Profile"),),
+        "| character slot | %d |" % slot,
+        "| character level | %s |" % skills.get("PlayerLevel"),
+        "| highest rank | %s |" % globals_.get("HighestRank"),
+        "| class | %s |" % skills.get("Class"),
+        "",
+        "### Masteries",
+        "",
+        "**This is the part that needs people.** Twenty-five of the twenty-seven tracks below",
+        "have no name yet. If you know what one is -- play a mission with one weapon type and",
+        "watch which row moves, or read a number off the game's own mastery screen and find it",
+        "here -- say so in the issue and it gets named in the next release.",
+        "",
+    ]
+    lines += _mastery_section(document, slot)
+    lines += [
+        "",
+        "### Weapons owned",
+        "",
+    ]
+    lines += _item_section(document, slot, "Weapons")
+    lines += [
+        "",
+        "### Equipment owned",
+        "",
+    ]
+    lines += _item_section(document, slot, "Equipment")
+
+    runs = claimed_items(document, slot) if isinstance(claimed, list) else []
+    lines += [
+        "",
+        "### Strongboxes/Claimed",
+        "",
+        "| | |",
+        "|---|---|",
+        "| raw length | %s |" % (len(claimed) if isinstance(claimed, list) else "not a list"),
+        "| runs parsed | %d |" % len(runs),
+        "| length accounted for | %d of %s |"
+        % (len(runs) * CLAIMED_RUN, len(claimed) if isinstance(claimed, list) else "?"),
+        "",
+        "A mismatch between the last two rows is worth reporting on its own: it means the",
+        "four-element run this tool reads is not what the game wrote into your file.",
+        "",
+        "### Every path in the file",
+        "",
+        "Names and types only -- no values. This is how fields nobody has documented get",
+        "found, and it is the one section not built from a list of named fields, which is why",
+        "it may not carry values.",
+        "",
+        "<details><summary>%d paths</summary>" % len(_schema_section(document)),
+        "",
+        "```",
+    ]
+    lines += _schema_section(document)
+    lines += ["```", "", "</details>", ""]
+    return "\n".join(lines)
+
+
+def cmd_contribute(args):
+    """Write a report about a save that can be shared, holding no identity.
+
+        py sas4.py contribute              write it, and print it
+        py sas4.py contribute --print      print it and write nothing
+
+    Twenty-five of the twenty-seven mastery tracks have no name, the first level threshold
+    is bounded but not pinned, and the format has fields nobody has explained. All three are
+    answered by more readings than one person's account can produce.
+
+    Nothing here sends anything anywhere. The report is written to a file and printed in
+    full, and posting it is a thing you do yourself, having read it. A save editor that
+    phoned home would deserve to be uninstalled, and no amount of anonymising would change
+    that -- the objection is to the sending, not to the contents.
+
+    What it carries is named field by field in `contribution_report`. What it refuses to
+    carry is checked for a second time before the file is written, against the shapes an
+    account id takes, so a mistake in that list fails loudly here rather than quietly on
+    somebody's GitHub issue.
+    """
+    _raw, document = load(args.file)
+    report = contribution_report(document, args.slot)
+
+    leaked = scan_report_for_ids(report)
+    if leaked:
+        print("refusing to write this report -- it contains something shaped like an id:")
+        for description, match in leaked[:10]:
+            print("  %-56s %s" % (match, description))
+        print("\nThis is a bug in the tool, not something you did. Please report it, with the")
+        print("lines above and without the report itself.")
+        return 1
+
+    print(report)
+    if args.print_only:
+        print("\n(--print: nothing written)")
+        return 0
+
+    os.makedirs(DATA, exist_ok=True)
+    out = os.path.join(DATA, "contribution.md")
+    with open(out, "w", encoding="utf-8") as handle:
+        handle.write(report)
+    print("\nwritten to  %s" % out)
+    print("\nEverything above is the whole of it. If you are happy to share it, open an issue")
+    print("at https://github.com/BananaSpaGetti/sas4-save-editor/issues -- there is a")
+    print("'Mastery track' template -- and paste it in. Nothing was sent.")
     return 0
 
 
