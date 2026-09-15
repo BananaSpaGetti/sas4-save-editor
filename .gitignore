@@ -3,3 +3,10 @@ backups/
 decoded/
 __pycache__/
 *.pyc
+
+# ===== C build output =====
+# The C port ships as source; the binary is built locally and never committed.
+c/build/
+c/*.o
+c/*.a
+c/*.exe

@@ -22,7 +22,10 @@ issue to open with a sample of the (redacted) structure.
 ## Submitting a change
 
 1. Fork the repository and create a branch.
-2. Keep it to standard-library Python 3.
+2. Keep the Python tools to standard-library Python 3. The C port in `c/` is C11 with
+   no dependencies beyond the Win32 libraries its Makefile already links; if you add a
+   command to `sas4.py`, the port needs it too, and `c/tests/differential_cli.py` is
+   what says whether the two agree.
 3. Test against a copy of a save, never the live profile — `sas4_model.py generate` makes a
    throwaway profile you can edit freely, and `sas4_model.py check` verifies consistency.
 4. Run `py sas4.py verify <file>` after any change that writes, to confirm the checksum.
