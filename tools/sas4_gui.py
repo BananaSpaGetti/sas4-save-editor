@@ -230,48 +230,48 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
                 "edit.\n\nClose the game, then press Save again.")
             return
 
-        summary = "\n".join("  %s\n      %s  ->  %s"
-                            % (p, json.dumps(sas4.at_path(self.document, p)), json.dumps(v))
+        def _current(path):
+            """The value staged over, or "<absent>" when the path is not in this document.
+
+            at_path raises rather than returning a miss, and this line runs before anything
+            is written -- so an absent path used to take the whole Save down with a
+            traceback, from the summary, without ever reaching the write that would have
+            reported it properly. apply_edits refuses such a path with a message naming it;
+            the confirmation now gets far enough to let it.
+            """
+            try:
+                return json.dumps(sas4.at_path(self.document, path))
+            except (KeyError, IndexError, TypeError):
+                return "<absent>"
+
+        summary = "\n".join("  %s\n      %s  ->  %s" % (p, _current(p), json.dumps(v))
                             for p, v in self.staged.items())
         if not self._ask("Write these changes?",
                                       "%s\n\nA backup is taken first."
                                       % summary):
             return
 
-        try:
-            # Inside the try on purpose: a backup that cannot be written -- a zip extracted
-            # under Program Files, a read-only share -- must stop the write and say so,
-            # not take the window down with a traceback.
-            saved = sas4.backup(self.path)
-            raw = open(self.path, "rb").read()
-            plain = dgdata.decode(raw)
-            # One value at a time, re-parsing in between: each replacement changes the
-            # document the next anchor is computed against.
-            for path, new in self.staged.items():
-                document = json.loads(plain)
-                anchor, old_length = sas4.anchor_for(document, plain, path)
-                replacement = anchor[:-old_length] + json.dumps(
-                    new, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-                plain = plain.replace(anchor, replacement, 1)
-
-            built = dgdata.encode(plain)
-            _, _, ok = dgdata.verify(built)
-            if not ok:
-                raise ValueError("the rebuilt file does not verify; nothing was written")
-            with open(self.path, "wb") as handle:
-                handle.write(built)
-        except Exception as problem:
-            self._error("Not written", "%s\n\nThe file is unchanged.\nBackups go to %s"
-                                 % (problem, sas4.BACKUPS))
+        # The write goes through `sas4.apply_edits` -- the same function `set` calls, and the
+        # same one `sas4_quick.py` and `sas4_gear.py` call. It used to be reimplemented here:
+        # a second, independent copy of the byte-level write path, living in the one file
+        # that lets a user edit any path in the profile, while this module's own docstring
+        # promised that everything here delegates. Building the plan and handing it over is
+        # what makes that promise true; the backup, the per-path failure and the refusal to
+        # write a file that does not verify are all its business now, not this window's.
+        ok, saved, message = sas4.apply_edits(self.path, list(self.staged.items()))
+        if not ok:
+            # apply_edits already names the backup directory in the one message where that
+            # matters (the backup itself failing), so this must not append it a second time.
+            self._error("Not written", "%s\n\nThe file is unchanged." % message)
             return
 
-        check = open(self.path, "rb").read()
-        stored, _, ok = dgdata.verify(check)
+        with open(self.path, "rb") as handle:
+            stored, _, verified = dgdata.verify(handle.read())
         count = len(self.staged)
         self.reload()
         self._info("Saved", "%d value%s written.\nChecksum %s (%s).\nBackup: %s"
                             % (count, "" if count == 1 else "s", stored,
-                               "valid" if ok else "MISMATCH", saved))
+                               "valid" if verified else "MISMATCH", saved))
 
     def open_file(self):
         chosen = self._pick_save("Open a profile")
