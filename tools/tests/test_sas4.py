@@ -857,6 +857,21 @@ class TestEditorSave(Temp):
         panel.staged.update([("Inventory/Profile0/Money", 1), ("Inventory/Profile0/Nope", 2)])
         panel.save()
         self.assertEqual(read(path), before, "the good value is not written on its own")
+        # And the staged edits survive. A failure here usually never touches the disk, so
+        # clearing them would throw away a session's work over one mistyped path -- which a
+        # plain reload() in the failure branch did, because reload() clears `staged`.
+        self.assertEqual(len(panel.staged), 2, "a failed save keeps what was staged")
+
+    def test_a_failed_save_keeps_every_staged_value(self):
+        """Twenty staged values must not vanish because one path was mistyped."""
+        path = self.make()
+        panel = self.editor(path)
+        staged = dict([("Inventory/Profile0/Money", n) for n in (1,)]
+                      + [("Inventory/Profile0/Skills/PlayerLevel", 7),
+                         ("Inventory/Profile0/NotAField", 3)])
+        panel.staged.update(staged)
+        panel.save()
+        self.assertEqual(panel.staged, staged, "nothing staged is lost by a failed save")
 
     def test_an_indexed_path_with_a_non_number_does_not_raise(self):
         """at_path runs int() on whatever is between the brackets.

@@ -134,7 +134,15 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
 
     # --- data ----------------------------------------------------------------------------
 
-    def reload(self):
+    def reload(self, keep_staged=False):
+        """Re-read the save from disk.
+
+        `keep_staged` is for the one caller that has to refresh the view after a FAILED save:
+        the file may or may not have been written, so the document must be re-read either
+        way, but the edits the user staged are still theirs and clearing them would throw
+        away a whole session's work over one mistyped path. Every other caller is switching
+        to a different file or has just written successfully, and wants them gone.
+        """
         try:
             raw, self.document = sas4.load(self.path)
         except Exception as problem:
@@ -144,7 +152,8 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
         stored, computed, ok = dgdata.verify(raw)
         self.checksum_ok = ok
         self.rows = [(p, v) for p, v in sas4.scalars(self.document)]
-        self.staged.clear()
+        if not keep_staged:
+            self.staged.clear()
         self.refresh()
         self.set_status("loaded %d values, checksum %s (%s)"
                         % (len(self.rows), stored, "valid" if ok else "MISMATCH"))
@@ -271,7 +280,12 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
             # the dialog sent the user away from a save that needed restoring. Only
             # apply_edits knows how far it got, and every one of its messages now says.
             self._error("Save failed", message)
-            self.reload()
+            # Re-read, because a post-write mismatch means the file on disk HAS changed and
+            # the view would otherwise be stale -- but keep the staged edits. Most failures
+            # here never touch the disk (a mistyped path, the rebuilt file not verifying),
+            # and a plain reload() clears `staged`, so twenty staged values were thrown away
+            # over one bad path, for a failure that wrote nothing.
+            self.reload(keep_staged=True)
             return
 
         with open(self.path, "rb") as handle:
