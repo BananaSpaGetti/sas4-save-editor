@@ -429,9 +429,21 @@ def apply_edits(file_path, plan):
 
     Returns (ok, backup_path, message). Nothing is written unless every anchor resolves and
     the rebuilt file verifies, so a partial application cannot reach the disk.
+
+    Every message says plainly whether the file was written, because the callers are three
+    windows and a command line that can only repeat what they are told. A failure before the
+    write ends in "nothing written"; the one failure that can happen after it says so
+    instead. A caller must not add a claim of its own about the file's state.
+
+    OSError is caught here and not left to the caller: every window writes through this
+    function, so catching it in one place is what keeps an unwritable file from becoming a
+    traceback in three different UIs -- the same reasoning as the backup failure below.
     """
-    with open(file_path, "rb") as handle:
-        raw = handle.read()
+    try:
+        with open(file_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as problem:
+        return False, None, "could not read %s (%s) -- nothing written" % (file_path, problem)
     try:
         saved = backup(file_path)
     except OSError as problem:
@@ -458,12 +470,27 @@ def apply_edits(file_path, plan):
     _, _, ok = dgdata.verify(built)
     if not ok:
         return False, saved, "the rebuilt file does not verify -- nothing written"
-    with open(file_path, "wb") as handle:
-        handle.write(built)
-    with open(file_path, "rb") as handle:
-        stored, _, ok = dgdata.verify(handle.read())
-    return ok, saved, "wrote %d field(s), checksum %s (%s)" % (
-        len(plan), stored, "VALID" if ok else "MISMATCH")
+    try:
+        with open(file_path, "wb") as handle:
+            handle.write(built)
+    except OSError as problem:
+        return False, saved, ("could not write %s (%s) -- the file may be incomplete; "
+                              "restore from %s" % (file_path, problem, saved))
+    try:
+        with open(file_path, "rb") as handle:
+            stored, _, ok = dgdata.verify(handle.read())
+    except OSError as problem:
+        return False, saved, ("wrote %d field(s) but could not read the file back (%s), so "
+                              "the checksum is unverified. The file WAS written; the backup "
+                              "is %s" % (len(plan), problem, saved))
+    if not ok:
+        # The bytes were verified before the write, so reaching here means what landed on
+        # disk is not what was verified. Whatever the cause, the file HAS been overwritten
+        # -- saying otherwise would send the user away from a save that needs restoring.
+        return False, saved, ("wrote %d field(s), but the file reads back with checksum %s "
+                              "(MISMATCH). The file WAS written and is not trustworthy; "
+                              "restore from %s" % (len(plan), stored, saved))
+    return True, saved, "wrote %d field(s), checksum %s (VALID)" % (len(plan), stored)
 
 
 

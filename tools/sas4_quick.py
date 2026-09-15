@@ -240,7 +240,12 @@ class Quick(sas4_ui.Dialogs, ttk.Frame):
 
         ok, saved, message = sas4.apply_edits(self.path.get(), changes)
         if not ok:
-            self._error("Not written", "%s\n\nBackup: %s" % (message, saved))
+            # "Save failed", not "Not written": a post-write checksum mismatch also returns
+            # ok=False, and by then the file has been overwritten. apply_edits' message says
+            # which of the two happened; the backup line is only added when there is a
+            # backup, since a failure before it returns None.
+            self._error("Save failed",
+                        "%s\n\nBackup: %s" % (message, saved) if saved else message)
             self.reload()
             return
         problems = model.check(sas4.load(self.path.get())[1])

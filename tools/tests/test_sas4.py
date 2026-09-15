@@ -652,6 +652,279 @@ class TestWindows(Temp):
             hub.destroy()
 
 
+class TestApplyEdits(Temp):
+    """apply_edits' contract, which three windows and a command line all repeat verbatim.
+
+    Its return is (ok, backup_path, message), and the message is the only thing a caller can
+    honestly show -- so each one has to say for itself whether the file was written. A caller
+    that adds its own claim gets it wrong for at least one path; that is a defect this suite
+    found in the Editor and now pins here.
+    """
+
+    def test_a_good_edit_reports_that_it_wrote(self):
+        path = self.make(level=5, money=1000)
+        self.original = read(path)
+        ok, saved, message = sas4.apply_edits(path, [("Inventory/Profile0/Money", 4242)])
+        self.assertTrue(ok, message)
+        self.assertIn("wrote 1 field", message)
+        self.assertIn("VALID", message)
+        # backup() returns the copied FILE, inside a timestamped directory -- not the
+        # directory itself. Every message that names it names this path.
+        self.assertTrue(os.path.isfile(saved), "the backup copy comes back")
+        self.assertEqual(read(saved), self.original, "and it is the save as it was")
+        self.assertEqual(sas4.at_path(sas4.load(path)[1], "Inventory/Profile0/Money"), 4242)
+
+    def test_an_absent_path_writes_nothing_and_says_so(self):
+        path = self.make()
+        before = read(path)
+        ok, _saved, message = sas4.apply_edits(path, [("Inventory/Profile0/NotAField", 1)])
+        self.assertFalse(ok)
+        self.assertIn("nothing written", message)
+        self.assertEqual(read(path), before, "the file is untouched")
+
+    def test_every_failure_before_the_write_says_nothing_written(self):
+        """The wording is load-bearing: it is what the windows show, verbatim."""
+        path = self.make()
+        for plan in ([("Inventory/Profile0/NotAField", 1)],
+                     [("Inventory/Profile0/Money", 1), ("Nope/Nope", 2)]):
+            ok, _saved, message = sas4.apply_edits(path, plan)
+            self.assertFalse(ok)
+            self.assertIn("nothing written", message)
+
+    def test_an_unreadable_source_is_a_message_not_a_traceback(self):
+        """OSError is caught here rather than in each window.
+
+        The Editor used to catch it itself. Routing its write through apply_edits removed
+        that catch without replacing it, so a file that could not be opened raised straight
+        out of the button handler with no dialog at all.
+        """
+        missing = os.path.join(self.dir, "no-such-profile.save")
+        ok, saved, message = sas4.apply_edits(missing, [("Inventory/Profile0/Money", 1)])
+        self.assertFalse(ok)
+        self.assertIsNone(saved, "nothing was backed up")
+        self.assertIn("nothing written", message)
+
+    def test_a_message_never_calls_a_written_file_unchanged(self):
+        """Not every ok=False means the file survived.
+
+        A checksum mismatch is only discovered by reading the file back, which is after the
+        write. Whatever the cause, the file HAS been overwritten by then -- so no message may
+        end in "nothing written" once the write has happened, or the user is sent away from a
+        save that needs restoring.
+        """
+        path = self.make()
+        # sas4's own dgdata, not this file's: each importlib load builds a separate module
+        # object, so patching the suite's copy would not reach apply_edits at all.
+        original_verify = sas4.dgdata.verify
+        calls = []
+
+        def verify_that_fails_only_on_the_read_back(raw):
+            stored, computed, ok = original_verify(raw)
+            calls.append(raw)
+            if len(calls) > 1:                      # the pre-write check passes as normal
+                return stored, computed, False
+            return stored, computed, ok
+
+        sas4.dgdata.verify = verify_that_fails_only_on_the_read_back
+        try:
+            ok, saved, message = sas4.apply_edits(path, [("Inventory/Profile0/Money", 77)])
+        finally:
+            sas4.dgdata.verify = original_verify
+
+        self.assertFalse(ok, "a mismatch is still a failure")
+        self.assertNotIn("nothing written", message)
+        self.assertIn("WAS written", message)
+        self.assertIn(saved, message, "and it names the backup to restore from")
+
+
+class TestEditorSave(Temp):
+    """The Editor's Save button, driven as the panel rather than as a window.
+
+    The C port is checked against sas4.py and never against a window, so nothing else in
+    either suite covers this method at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import tkinter
+            self.root = tkinter.Tk()
+        except Exception as problem:             # no tkinter, or no display to open on
+            self.skipTest("tkinter is not usable here: %s" % problem)
+        self.root.withdraw()
+        self.gui_module = _load("sas4_gui")
+
+        # sas4_gui loads its OWN sas4 by path, so Temp.setUp's redirect -- which is applied
+        # to this file's copy -- does not reach the panel. Without this the first run of
+        # these tests wrote eight backup directories beside the real profile.
+        self.panel_sas4 = self.gui_module.sas4
+        self._panel_backups = self.panel_sas4.BACKUPS
+        self.panel_sas4.BACKUPS = sas4.BACKUPS
+        self.real_backups = self._panel_backups
+        self._before = self._real_backup_names()
+
+    def _real_backup_names(self):
+        try:
+            return sorted(os.listdir(self.real_backups))
+        except OSError:
+            return []
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.panel_sas4.BACKUPS = self._panel_backups
+        # A test that writes outside its temp directory has to fail, not litter quietly.
+        after = self._real_backup_names()
+        super().tearDown()
+        assert after == self._before, (
+            "this test wrote into the real backups directory: %s"
+            % sorted(set(after) - set(self._before)))
+
+    def editor(self, path):
+        """The panel, with every dialog replaced by a recorder and Save always confirmed."""
+        panel = self.gui_module.Editor(self.root, path)
+        panel.shown = []
+        panel._ask = lambda title, message: True
+        panel._info = lambda title, message: panel.shown.append(("info", title, message))
+        panel._error = lambda title, message: panel.shown.append(("error", title, message))
+        panel._warn = lambda title, message: panel.shown.append(("warn", title, message))
+        return panel
+
+    def reference(self, path, plan):
+        """The bytes `set` would write, from a byte-identical copy of the same save."""
+        copy_path = os.path.join(self.dir, "reference-%d.save" % len(os.listdir(self.dir)))
+        with open(copy_path, "wb") as handle:
+            handle.write(read(path))
+        ok, _saved, message = sas4.apply_edits(copy_path, plan)
+        self.assertTrue(ok, message)
+        return read(copy_path)
+
+    def test_one_value_writes_the_same_bytes_as_the_command_line(self):
+        path = self.make(level=5, money=1000)
+        plan = [("Inventory/Profile0/Money", 9876)]
+        expected = self.reference(path, plan)
+
+        panel = self.editor(path)
+        panel.staged.update(plan)
+        panel.save()
+
+        self.assertEqual(read(path), expected)
+        self.assertEqual([kind for kind, _t, _m in panel.shown], ["info"])
+
+    def test_several_values_at_once_write_the_same_bytes(self):
+        path = self.make(level=5, money=1000)
+        plan = [("Inventory/Profile0/Money", 31337), ("Inventory/Profile0/Skills/PlayerLevel", 12)]
+        expected = self.reference(path, plan)
+
+        panel = self.editor(path)
+        panel.staged.update(plan)
+        panel.save()
+        self.assertEqual(read(path), expected)
+
+    def test_nothing_staged_writes_nothing(self):
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        panel.save()
+        self.assertEqual(read(path), before)
+        self.assertEqual(panel.shown, [], "and says nothing about it")
+
+    def test_one_backup_for_the_whole_save_not_one_per_value(self):
+        path = self.make()
+        panel = self.editor(path)
+        panel.staged.update([("Inventory/Profile0/Money", 5), ("Inventory/Profile0/Skills/PlayerLevel", 6)])
+        panel.save()
+        backups = os.listdir(sas4.BACKUPS)
+        self.assertEqual(len(backups), 1, "two values, one backup: %s" % backups)
+
+    def test_an_absent_path_is_refused_by_name_without_a_traceback(self):
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        panel.staged["Inventory/Profile0/NotAField"] = 1
+        panel.save()                                  # must not raise
+        self.assertEqual(read(path), before)
+        kinds = [kind for kind, _t, _m in panel.shown]
+        self.assertEqual(kinds, ["error"])
+        self.assertIn("NotAField", panel.shown[0][2])
+
+    def test_a_good_path_alongside_an_absent_one_writes_neither(self):
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        panel.staged.update([("Inventory/Profile0/Money", 1), ("Inventory/Profile0/Nope", 2)])
+        panel.save()
+        self.assertEqual(read(path), before, "the good value is not written on its own")
+
+    def test_an_indexed_path_with_a_non_number_does_not_raise(self):
+        """at_path runs int() on whatever is between the brackets.
+
+        So "...[x]" raises ValueError, not KeyError, whenever the name before it exists --
+        and the confirmation summary runs at_path on every staged path BEFORE anything is
+        written. Catching only KeyError/IndexError/TypeError left that one path shape taking
+        the whole Save down with a traceback, which is the defect the summary's own docstring
+        claims to have fixed.
+        """
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        # The name before the brackets has to EXIST, or the walk raises KeyError on it and
+        # int() is never reached -- which is how the first version of this test passed
+        # against the unfixed code. Weapons is a real list in every generated profile.
+        panel.staged["Inventory/Profile0/Weapons[x]"] = 1
+        panel.save()                                  # must not raise
+        self.assertEqual(read(path), before)
+        self.assertEqual([kind for kind, _t, _m in panel.shown], ["error"])
+
+    def test_the_failure_dialog_never_claims_the_file_is_unchanged(self):
+        """The window cannot know that, and said it anyway.
+
+        apply_edits returns ok=False for a post-write checksum mismatch too, so a dialog that
+        appends "The file is unchanged" is wrong exactly when being wrong costs the most.
+        """
+        path = self.make()
+        panel = self.editor(path)
+        panel.staged["Inventory/Profile0/NotAField"] = 1
+        panel.save()
+        self.assertTrue(panel.shown)
+        self.assertNotIn("unchanged", panel.shown[0][2],
+                         "the window must repeat apply_edits' message, not add to it")
+
+    def test_a_refused_confirmation_writes_nothing(self):
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        panel._ask = lambda title, message: False
+        panel.staged["Inventory/Profile0/Money"] = 1
+        panel.save()
+        self.assertEqual(read(path), before)
+
+    def test_the_game_running_stops_the_write(self):
+        path = self.make()
+        before = read(path)
+        panel = self.editor(path)
+        original = self.panel_sas4.game_running
+        self.panel_sas4.game_running = lambda: True   # the panel's copy, not this file's
+        try:
+            panel.staged["Inventory/Profile0/Money"] = 1
+            panel.save()
+        finally:
+            self.panel_sas4.game_running = original
+        self.assertEqual(read(path), before)
+        self.assertEqual([kind for kind, _t, _m in panel.shown], ["warn"])
+
+    def test_writing_a_value_that_is_already_set_still_verifies(self):
+        path = self.make(money=1000)
+        panel = self.editor(path)
+        panel.staged["Inventory/Profile0/Money"] = 1000
+        panel.save()
+        raw, document = sas4.load(path)
+        self.assertEqual(sas4.at_path(document, "Inventory/Profile0/Money"), 1000)
+        self.assertTrue(dgdata.verify(raw)[2])
+
+
 class TestContribute(Temp):
     """The shared report: what it carries, and what it must never carry."""
 

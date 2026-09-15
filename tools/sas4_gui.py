@@ -241,7 +241,12 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
             """
             try:
                 return json.dumps(sas4.at_path(self.document, path))
-            except (KeyError, IndexError, TypeError):
+            except (KeyError, IndexError, TypeError, ValueError):
+                # ValueError belongs here: at_path runs int() on whatever sits between the
+                # brackets, so "A[x]" raises it rather than KeyError whenever A itself
+                # exists. Leaving it out left exactly the traceback this docstring claims
+                # to have fixed, for that one path shape. apply_edits has caught ValueError
+                # alongside the rest since it was written.
                 return "<absent>"
 
         summary = "\n".join("  %s\n      %s  ->  %s" % (p, _current(p), json.dumps(v))
@@ -260,9 +265,13 @@ class Editor(sas4_ui.Dialogs, ttk.Frame):
         # write a file that does not verify are all its business now, not this window's.
         ok, saved, message = sas4.apply_edits(self.path, list(self.staged.items()))
         if not ok:
-            # apply_edits already names the backup directory in the one message where that
-            # matters (the backup itself failing), so this must not append it a second time.
-            self._error("Not written", "%s\n\nThe file is unchanged." % message)
+            # apply_edits' message is shown as it stands. This used to append "The file is
+            # unchanged", which is a claim this window cannot make: a post-write checksum
+            # mismatch also returns ok=False, and by then the file HAS been overwritten, so
+            # the dialog sent the user away from a save that needed restoring. Only
+            # apply_edits knows how far it got, and every one of its messages now says.
+            self._error("Save failed", message)
+            self.reload()
             return
 
         with open(self.path, "rb") as handle:
