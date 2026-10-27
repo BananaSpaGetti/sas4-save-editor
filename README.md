@@ -5,6 +5,13 @@ and editing the profile on disk. `docs/FINDINGS.md` is the handover document -- 
 established, how, and what is closed, including why memory editing does not work on this
 game.
 
+<p align="center">
+  <img src="assets/sas4-quick.png" width="49%" alt="Quick tab: level, money and item grants">
+  <img src="assets/sas4-everything.png" width="49%" alt="Everything tab: every value in the save, editable">
+</p>
+
+*The editor window (`sas4.bat`), opened on a synthetic profile written by `sas4_model.py generate` (level 42, money 125,000). Left: the Quick tab. Right: every value in the file.*
+
 ## Requirements
 
 There are two ways to run the command line, and they need different things.
